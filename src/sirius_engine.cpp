@@ -163,7 +163,7 @@ void sirius_engine::execute()
 {
   if (!sirius_pipelines.empty()) {
     auto sirius_pipeline_map = sirius::sirius_pipeline_hashmap(sirius_pipelines);
-    auto sirius_context      = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    auto sirius_context      = GetOrCreateSiriusContext(context);
     D_ASSERT(sirius_context);
     if (!sirius_context) {
       SIRIUS_LOG_DEBUG("Sirius context not found, skipping task creation");
