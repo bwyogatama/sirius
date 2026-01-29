@@ -73,6 +73,7 @@ using sirius::op::sirius_physical_materialized_collector;
 using sirius::op::sirius_physical_operator;
 using sirius::op::sirius_physical_partition;
 using sirius::op::sirius_physical_result_collector;
+using sirius::op::SiriusPhysicalOperatorType;
 using sirius::pipeline::sirius_pipeline;
 using sirius::planner::sirius_physical_plan_generator;
 using sirius::sirius_engine;
@@ -445,7 +446,7 @@ size_t count_partition_sinks(const duckdb::vector<duckdb::shared_ptr<sirius_pipe
 {
   size_t count = 0;
   for (const auto& pipeline : pipelines) {
-    if (pipeline->get_sink()->type == PhysicalOperatorType::INVALID) { count++; }
+    if (pipeline->get_sink()->type == SiriusPhysicalOperatorType::INVALID) { count++; }
   }
   return count;
 }
@@ -468,7 +469,7 @@ bool has_concat_operator(const duckdb::vector<duckdb::shared_ptr<sirius_pipeline
  * @brief Count pipelines with a specific sink type
  */
 size_t count_sink_type(const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines,
-                       PhysicalOperatorType type)
+                       SiriusPhysicalOperatorType type)
 {
   size_t count = 0;
   for (const auto& pipeline : pipelines) {
@@ -501,7 +502,7 @@ PipelineBreakdownInfo analyze_pipeline_breakdown(
     auto sink = pipeline->get_sink();
 
     // Count PARTITION sinks
-    if (sink->type == PhysicalOperatorType::INVALID) {
+    if (sink->type == SiriusPhysicalOperatorType::INVALID) {
       info.partition_count++;
       info.has_partition_before_agg = true;
 
@@ -586,7 +587,7 @@ HashJoinBreakdownInfo analyze_hash_join_breakdown(
     auto sink = pipeline->get_sink();
 
     // Check PARTITION sinks
-    if (sink->type == PhysicalOperatorType::INVALID) {
+    if (sink->type == SiriusPhysicalOperatorType::INVALID) {
       auto& partition = sink->Cast<sirius_physical_partition>();
 
       if (partition.is_build_partition()) {
@@ -640,8 +641,8 @@ HashJoinBreakdownInfo analyze_hash_join_breakdown(
             // Check if dependent pipeline has HASH_JOIN in operators
             auto ops = dep_pipeline->get_inner_operators();
             for (auto& op : ops) {
-              if (op.get().type == PhysicalOperatorType::HASH_JOIN ||
-                  op.get().type == PhysicalOperatorType::NESTED_LOOP_JOIN) {
+              if (op.get().type == SiriusPhysicalOperatorType::HASH_JOIN ||
+                  op.get().type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
                 info.partition_connects_to_join = true;
                 info.join_pipelines_from_partition++;
               }
@@ -667,11 +668,11 @@ HashJoinBreakdownInfo analyze_hash_join_breakdown(
     }
 
     // Check for pipelines that have PARTITION source and contain HASH_JOIN
-    if (pipeline->get_source()->type == PhysicalOperatorType::INVALID) {
+    if (pipeline->get_source()->type == SiriusPhysicalOperatorType::INVALID) {
       auto ops = pipeline->get_inner_operators();
       for (auto& op : ops) {
-        if (op.get().type == PhysicalOperatorType::HASH_JOIN ||
-            op.get().type == PhysicalOperatorType::NESTED_LOOP_JOIN) {
+        if (op.get().type == SiriusPhysicalOperatorType::HASH_JOIN ||
+            op.get().type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
           // This is the continuation pipeline after partition break
           break;
         }
@@ -743,7 +744,7 @@ void validate_modified_pipeline_structure(sirius_engine& engine, const std::stri
                                    ")";
 
     // Validate based on sink type
-    if (sink->type == PhysicalOperatorType::INVALID) {
+    if (sink->type == SiriusPhysicalOperatorType::INVALID) {
       // This is a PARTITION operator
       auto& partition     = sink->Cast<sirius_physical_partition>();
       std::string port_id = partition.is_build_partition() ? "build" : "default";
@@ -792,10 +793,10 @@ void validate_modified_pipeline_structure(sirius_engine& engine, const std::stri
         REQUIRE(std::string(next_port_id) == port_id);
       }
 
-    } else if (sink->type == PhysicalOperatorType::HASH_GROUP_BY ||
-               sink->type == PhysicalOperatorType::ORDER_BY ||
-               sink->type == PhysicalOperatorType::TOP_N ||
-               sink->type == PhysicalOperatorType::UNGROUPED_AGGREGATE) {
+    } else if (sink->type == SiriusPhysicalOperatorType::HASH_GROUP_BY ||
+               sink->type == SiriusPhysicalOperatorType::ORDER_BY ||
+               sink->type == SiriusPhysicalOperatorType::TOP_N ||
+               sink->type == SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE) {
       // These should have "default" port
       auto it = source_to_pipelines.find(sink.get());
       if (it != source_to_pipelines.end()) {
@@ -817,7 +818,7 @@ void validate_modified_pipeline_structure(sirius_engine& engine, const std::stri
         }
       }
 
-    } else if (sink->type == PhysicalOperatorType::RESULT_COLLECTOR) {
+    } else if (sink->type == SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
       // Should have "final" port
       auto* port          = sink->get_port("final");
       std::string context = pipeline_context + " -> RESULT_COLLECTOR with port 'final'";
@@ -828,7 +829,7 @@ void validate_modified_pipeline_structure(sirius_engine& engine, const std::stri
       REQUIRE(port->src_pipeline == pipeline);
       REQUIRE(port->dest_pipeline == nullptr);
 
-    } else if (sink->type == PhysicalOperatorType::RIGHT_DELIM_JOIN) {
+    } else if (sink->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
       // Validate partition_join and partition_distinct ports
       auto& delim_join         = sink->Cast<sirius_physical_delim_join>();
       auto* partition_join     = delim_join.partition_join;
@@ -866,7 +867,7 @@ void validate_modified_pipeline_structure(sirius_engine& engine, const std::stri
         }
       }
 
-    } else if (sink->type == PhysicalOperatorType::LEFT_DELIM_JOIN) {
+    } else if (sink->type == SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
       // Validate partition_distinct and column_data_scan ports
       auto& delim_join         = sink->Cast<sirius_physical_delim_join>();
       auto* partition_distinct = delim_join.partition_distinct;
@@ -907,7 +908,7 @@ void validate_modified_pipeline_structure(sirius_engine& engine, const std::stri
         }
       }
 
-    } else if (sink->type == PhysicalOperatorType::CTE) {
+    } else if (sink->type == SiriusPhysicalOperatorType::CTE) {
       // CTE should have "default" port connections to CTE scans
       auto& cte_op = sink->Cast<sirius_physical_cte>();
       for (auto& cte_scan_ref : cte_op.cte_scans) {
@@ -933,7 +934,7 @@ void validate_modified_pipeline_structure(sirius_engine& engine, const std::stri
     }
 
     // Validate TABLE_SCAN source ports
-    if (source->type == PhysicalOperatorType::TABLE_SCAN) {
+    if (source->type == SiriusPhysicalOperatorType::TABLE_SCAN) {
       // next_op is first inner operator or sink
       auto inner_ops = pipeline->get_inner_operators();
       sirius_physical_operator* next_op =
@@ -1179,13 +1180,13 @@ TEST_CASE("Pipeline breakdown - HASH_JOIN build side validation",
   bool found_build_partition_with_port = false;
   for (const auto& pipeline : engine.new_scheduled) {
     auto sink = pipeline->get_sink();
-    if (sink->type == PhysicalOperatorType::INVALID) {
+    if (sink->type == SiriusPhysicalOperatorType::INVALID) {
       auto& partition = sink->Cast<sirius_physical_partition>();
       if (partition.is_build_partition()) {
         // The partition's parent_op is the HASH_JOIN
         sirius_physical_operator* hash_join_op = partition.get_parent_op();
         REQUIRE(hash_join_op != nullptr);
-        REQUIRE(hash_join_op->type == PhysicalOperatorType::HASH_JOIN);
+        REQUIRE(hash_join_op->type == SiriusPhysicalOperatorType::HASH_JOIN);
 
         // Find the pipeline where HASH_JOIN is the first operator
         for (const auto& dep_pipeline : engine.new_scheduled) {
@@ -1252,7 +1253,7 @@ TEST_CASE("Pipeline breakdown - HASH_JOIN probe side validation",
   bool found_join_after_probe_partition = false;
   for (const auto& pipeline : engine.new_scheduled) {
     auto sink = pipeline->get_sink();
-    if (sink->type == PhysicalOperatorType::INVALID) {
+    if (sink->type == SiriusPhysicalOperatorType::INVALID) {
       auto& partition = sink->Cast<sirius_physical_partition>();
       if (!partition.is_build_partition()) {
         // This is a probe partition - check it uses "default" port
@@ -1268,7 +1269,7 @@ TEST_CASE("Pipeline breakdown - HASH_JOIN probe side validation",
           for (auto& dep_pipeline : it->second) {
             auto ops = dep_pipeline->get_inner_operators();
             for (auto& op : ops) {
-              if (op.get().type == PhysicalOperatorType::HASH_JOIN) {
+              if (op.get().type == SiriusPhysicalOperatorType::HASH_JOIN) {
                 found_join_after_probe_partition = true;
 
                 // Verify the HASH_JOIN has the "default" port for probe
@@ -1389,7 +1390,7 @@ TEST_CASE("Pipeline breakdown - CTE pattern", "[modified_pipeline][cte]")
   // Check for CTE sink
   bool has_cte = false;
   for (const auto& pipeline : engine.new_scheduled) {
-    if (pipeline->get_sink()->type == PhysicalOperatorType::CTE) {
+    if (pipeline->get_sink()->type == SiriusPhysicalOperatorType::CTE) {
       has_cte = true;
       break;
     }

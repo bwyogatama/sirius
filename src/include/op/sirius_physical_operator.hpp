@@ -20,7 +20,6 @@
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/enums/operator_result_type.hpp"
 #include "duckdb/common/enums/order_preservation_type.hpp"
-#include "duckdb/common/enums/physical_operator_type.hpp"
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/execution/execution_context.hpp"
@@ -28,13 +27,10 @@
 #include "duckdb/execution/physical_operator_states.hpp"
 #include "duckdb/optimizer/join_order/join_node.hpp"
 #include "helper/types.hpp"
+#include "op/sirius_physical_operator_type.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
-
-namespace duckdb {
-class GPUExecutor;
-}  // namespace duckdb
 
 namespace sirius {
 
@@ -62,10 +58,10 @@ enum class MemoryBarrierType { PIPELINE, PARTIAL, FULL };
 //! execution plan
 class sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE = duckdb::PhysicalOperatorType::INVALID;
+  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::INVALID;
 
  public:
-  sirius_physical_operator(duckdb::PhysicalOperatorType type,
+  sirius_physical_operator(SiriusPhysicalOperatorType type,
                            duckdb::vector<duckdb::LogicalType> types,
                            duckdb::idx_t estimated_cardinality)
     : type(type), types(std::move(types)), estimated_cardinality(estimated_cardinality)
@@ -76,7 +72,7 @@ class sirius_physical_operator {
   virtual ~sirius_physical_operator() {}
 
   //! The physical operator type
-  duckdb::PhysicalOperatorType type;
+  SiriusPhysicalOperatorType type;
   //! The set of children of the operator
   duckdb::vector<duckdb::unique_ptr<sirius_physical_operator>> children;
   //! The types returned by this physical operator
@@ -170,7 +166,7 @@ class sirius_physical_operator {
   template <class TARGET>
   TARGET& Cast()
   {
-    if (TARGET::TYPE != duckdb::PhysicalOperatorType::INVALID && type != TARGET::TYPE) {
+    if (TARGET::TYPE != SiriusPhysicalOperatorType::INVALID && type != TARGET::TYPE) {
       throw duckdb::InternalException(
         "Failed to cast physical operator to type - physical operator type mismatch");
     }
@@ -180,7 +176,7 @@ class sirius_physical_operator {
   template <class TARGET>
   const TARGET& Cast() const
   {
-    if (TARGET::TYPE != duckdb::PhysicalOperatorType::INVALID && type != TARGET::TYPE) {
+    if (TARGET::TYPE != SiriusPhysicalOperatorType::INVALID && type != TARGET::TYPE) {
       throw duckdb::InternalException(
         "Failed to cast physical operator to type - physical operator type mismatch");
     }
