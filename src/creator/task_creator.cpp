@@ -16,6 +16,7 @@
 
 #include "creator/task_creator.hpp"
 
+#include "log/logging.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
