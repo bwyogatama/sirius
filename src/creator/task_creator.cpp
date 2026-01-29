@@ -91,8 +91,10 @@ void task_creator::set_client_context(::duckdb::ClientContext& client_context)
 void task_creator::set_pipeline_hashmap(sirius_pipeline_hashmap& sirius_pipeline_map)
 {
   _sirius_pipeline_map = &sirius_pipeline_map;
+  std::lock_guard<std::mutex> lock(_priority_scans_mutex);
   for (const auto& i : _sirius_pipeline_map->_vec) {
     if (i->get_source()->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
+      printf("Adding priority scan task\n");
       _priority_scans.push(i);
     }
   }
@@ -100,6 +102,7 @@ void task_creator::set_pipeline_hashmap(sirius_pipeline_hashmap& sirius_pipeline
 
 void task_creator::reset()
 {
+  std::lock_guard<std::mutex> lock(_priority_scans_mutex);
   _priority_scans = std::queue<duckdb::shared_ptr<pipeline::sirius_pipeline>>{};
 }
 
@@ -116,6 +119,7 @@ void task_creator::process_next_task(op::sirius_physical_operator* node)
     auto pipeline = std::get<duckdb::shared_ptr<pipeline::sirius_pipeline>>(hint);
     process_next_task(&pipeline->get_inner_operators()[0].get());
   } else {
+    std::lock_guard<std::mutex> lock(_priority_scans_mutex);
     if (!_priority_scans.empty()) {
       duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline = _priority_scans.front();
       auto* scan_node                                        = pipeline->get_source().get();
@@ -128,6 +132,7 @@ void task_creator::process_next_task(op::sirius_physical_operator* node)
 void task_creator::start()
 {
   start_thread_pool();
+  std::lock_guard<std::mutex> lock(_priority_scans_mutex);
   while (!_priority_scans.empty()) {
     duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline = _priority_scans.front();
     auto* scan_node                                        = pipeline->get_source().get();
@@ -176,6 +181,7 @@ void task_creator::worker_function(int worker_id)
     try {
       // scheduling scan task
       if (info->_node->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
+        printf("worker %d: Scheduling scan task\n", worker_id);
         info->_pipeline->get_source()->set_creator(this);
         auto scan_task_global_state = std::make_shared<op::scan::duckdb_scan_task_global_state>(
           info->_pipeline,
@@ -206,6 +212,7 @@ void task_creator::worker_function(int worker_id)
         _duckdb_scan_executor.schedule(std::move(scan_task));
         // scheduling pipeline task
       } else {
+        printf("worker %d: Scheduling task\n", worker_id);
         duckdb::reference<sirius::op::sirius_physical_operator> node =
           info->_pipeline->get_inner_operators()[0];
         info->_pipeline->get_sink()->set_creator(this);
