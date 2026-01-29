@@ -52,7 +52,7 @@ namespace duckdb {
 void GPUExecutor::Reset()
 {
   // lock_guard<mutex> elock(executor_lock);
-  gpu_physical_plan    = nullptr;
+  gpu_physical_plan = nullptr;
   // cancelled = false;
   gpu_owned_plan.reset();
   // root_executor.reset();
@@ -355,4 +355,4 @@ unique_ptr<QueryResult> GPUExecutor::GetResult()
   return res;
 }
 
-};  // namespace duckdb
+}  // namespace duckdb

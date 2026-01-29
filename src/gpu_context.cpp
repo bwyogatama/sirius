@@ -53,7 +53,7 @@ void GPUBindPreparedStatementParameters(PreparedStatementData& statement,
   statement.Bind(std::move(owned_values));
 }
 
-GPUContext::GPUContext(ClientContext& client_context) : client_context(client_context) {};
+GPUContext::GPUContext(ClientContext& client_context) : client_context(client_context) {}
 
 // This function is based on ClientContext::PendingStatementOrPreparedStatement
 unique_ptr<PendingQueryResult> GPUContext::GPUPendingStatementOrPreparedStatement(
@@ -76,7 +76,7 @@ unique_ptr<PendingQueryResult> GPUContext::GPUPendingStatementOrPreparedStatemen
   }
   D_ASSERT(gpu_active_query->IsOpenResult(*pending));
   return pending;
-};
+}
 
 void GPUContext::GPUProcessError(ErrorData& error, const string& query) const
 {
@@ -134,7 +134,7 @@ unique_ptr<PendingQueryResult> GPUContext::GPUPendingStatementInternal(
   gpu_active_query->gpu_prepared = std::move(statement_p);
   gpu_active_query->SetOpenResult(*pending_result);
   return pending_result;
-};
+}
 
 GPUExecutor& GPUContext::GetGPUExecutor()
 {
@@ -205,7 +205,7 @@ unique_ptr<QueryResult> GPUContext::GPUExecuteQuery(
   }
   SIRIUS_LOG_DEBUG("Done GPUExecuteQuery");
   return current_result;
-};
+}
 
 void GPUContext::BeginQueryInternal(const string& query)
 {
@@ -334,7 +334,7 @@ unique_ptr<PendingQueryResult> GPUContext::SiriusPendingStatementOrPreparedState
   }
   D_ASSERT(gpu_active_query->IsOpenResult(*pending));
   return pending;
-};
+}
 
 // This function is based on ClientContext::PendingPreparedStatementInternal
 unique_ptr<PendingQueryResult> GPUContext::SiriusPendingStatementInternal(
@@ -348,13 +348,15 @@ unique_ptr<PendingQueryResult> GPUContext::SiriusPendingStatementInternal(
   GPUBindPreparedStatementParameters(statement, parameters);
 
   unique_ptr<::sirius::sirius_engine> temp = make_uniq<::sirius::sirius_engine>(context, *this);
-  auto prop                    = temp->context.GetClientProperties();
-  gpu_active_query->engine = std::move(temp);
-  auto& engine             = GetSiriusEngine();
-  bool stream_result = false;
+  auto prop                                = temp->context.GetClientProperties();
+  gpu_active_query->engine                 = std::move(temp);
+  auto& engine                             = GetSiriusEngine();
+  bool stream_result                       = false;
 
   unique_ptr<::sirius::op::sirius_physical_result_collector> sirius_collector =
-    make_uniq_base<::sirius::op::sirius_physical_result_collector, ::sirius::op::sirius_physical_materialized_collector>(*statement_p, client_context);
+    make_uniq_base<::sirius::op::sirius_physical_result_collector,
+                   ::sirius::op::sirius_physical_materialized_collector>(*statement_p,
+                                                                         client_context);
   if (sirius_collector->type != ::sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
     return GPUErrorResult<PendingQueryResult>(ErrorData("Error in SiriusPendingStatementInternal"));
   }
@@ -370,7 +372,7 @@ unique_ptr<PendingQueryResult> GPUContext::SiriusPendingStatementInternal(
   gpu_active_query->sirius_prepared = std::move(statement_p);
   gpu_active_query->SetOpenResult(*pending_result);
   return pending_result;
-};
+}
 
 // This function is based on PendingQueryResult::ExecuteInternal
 unique_ptr<QueryResult> GPUContext::SiriusExecutePendingQueryResult(PendingQueryResult& pending)
@@ -412,7 +414,7 @@ unique_ptr<QueryResult> GPUContext::SiriusExecuteQuery(
   }
   SIRIUS_LOG_DEBUG("Done SiriusExecuteQuery");
   return current_result;
-};
+}
 
 sirius::sirius_engine& GPUContext::GetSiriusEngine()
 {
@@ -421,4 +423,4 @@ sirius::sirius_engine& GPUContext::GetSiriusEngine()
   return *gpu_active_query->engine;
 }
 
-};  // namespace duckdb
+}  // namespace duckdb
