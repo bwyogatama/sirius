@@ -86,6 +86,7 @@ task_creator::~task_creator() { stop_thread_pool(); }
 void task_creator::set_client_context(::duckdb::ClientContext& client_context)
 {
   _client_context = std::addressof(client_context);
+  _thread_context = std::make_unique<duckdb::ThreadContext>(client_context);
 }
 
 void task_creator::set_pipeline_hashmap(sirius_pipeline_hashmap& sirius_pipeline_map)
@@ -184,21 +185,14 @@ void task_creator::worker_function(int worker_id)
         printf("worker %d: Scheduling scan task\n", worker_id);
         info->_pipeline->get_source()->set_creator(this);
         auto scan_task_global_state = std::make_shared<op::scan::duckdb_scan_task_global_state>(
-          info->_pipeline,
-          _duckdb_scan_executor,
-          *_client_context,
-          &info->_node->Cast<op::sirius_physical_table_scan>());
-        // Create owned thread and execution contexts that will be moved into the local state
-        auto thread_ctx = std::make_unique<duckdb::ThreadContext>(*_client_context);
+          info->_pipeline, _duckdb_scan_executor, *_client_context, scan_op);
         auto exec_ctx =
-          std::make_unique<duckdb::ExecutionContext>(*_client_context, *thread_ctx, nullptr);
+          std::make_unique<duckdb::ExecutionContext>(*_client_context, *_thread_context, nullptr);
         auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
           *scan_task_global_state,
-          *exec_ctx,
           duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE,
           duckdb::Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE,
           nullptr,
-          std::move(thread_ctx),
           std::move(exec_ctx));
         if (info->destination_data_repositories.empty()) {
           throw std::runtime_error(
