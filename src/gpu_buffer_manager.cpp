@@ -173,27 +173,26 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu,
   allocation_table.resize(NUM_GPUS);
   locked_allocation_table.resize(NUM_GPUS);
   SIRIUS_LOG_INFO("Allocated processing size {} in GPU 0", processing_size_per_gpu);
-
   for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
     // We cannot allocate exactly all free memory using `cudaMalloc()`
-    size_t free_gpu_mem_size = getFreeGPUMemorySize(gpu) * 0.99;
-    if (free_gpu_mem_size >= cache_size_per_gpu) {
-      gpuCache[gpu]                 = callCudaMalloc<uint8_t>(cache_size_per_gpu, gpu);
-      cpuCache[gpu]                 = nullptr;
+    // size_t free_gpu_mem_size = getFreeGPUMemorySize(gpu) * 0.99;
+    // if (free_gpu_mem_size >= cache_size_per_gpu) {
+      // gpuCache[gpu]                 = callCudaMalloc<uint8_t>(cache_size_per_gpu, gpu);
+    //   cpuCache[gpu]                 = nullptr;
       available_gpu_cache_size[gpu] = cache_size_per_gpu;
-      SIRIUS_LOG_INFO("Allocated cache size {} in GPU 0", cache_size_per_gpu);
-    } else {
-      gpuCache[gpu] = callCudaMalloc<uint8_t>(free_gpu_mem_size, gpu);
-      cpuCache[gpu] = allocatePinnedCPUMemory(cache_size_per_gpu - free_gpu_mem_size);
-      available_gpu_cache_size[gpu] = free_gpu_mem_size;
-      SIRIUS_LOG_INFO("Allocated cache size {} for GPU 0 ({} in GPU, {} in CPU)",
-                      cache_size_per_gpu,
-                      free_gpu_mem_size,
-                      cache_size_per_gpu - free_gpu_mem_size);
-    }
+    //   SIRIUS_LOG_INFO("Allocated cache size {} in GPU 0", cache_size_per_gpu);
+    // } else {
+    //   gpuCache[gpu] = callCudaMalloc<uint8_t>(free_gpu_mem_size, gpu);
+      // cpuCache[gpu] = allocatePinnedCPUMemory(cache_size_per_gpu - free_gpu_mem_size);
+      // available_gpu_cache_size[gpu] = free_gpu_mem_size;
+    //   SIRIUS_LOG_INFO("Allocated cache size {} for GPU 0 ({} in GPU, {} in CPU)",
+    //                   cache_size_per_gpu,
+    //                   free_gpu_mem_size,
+    //                   cache_size_per_gpu - free_gpu_mem_size);
+    // }
 
-    // gpuProcessing[gpu] = callCudaMalloc<uint8_t>(processing_size_per_gpu, gpu);
-    // gpuCache[gpu] = callCudaHostAlloc<uint8_t>(cache_size_per_gpu, 1);
+    // gpuProcessing[gpu] = callCudaMalloc<uint8_t>(processing_size_per_gpu, 0);
+    gpuCache[gpu] = callCudaHostAlloc<uint8_t>(cache_size_per_gpu, 1);
     // gpuProcessing[gpu] = callCudaHostAlloc<uint8_t>(processing_size_per_gpu, 1);
     gpuProcessingPointer[gpu] = 0;
     gpuCachingPointer[gpu]    = 0;
