@@ -182,9 +182,12 @@ sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_v
 void sirius_physical_operator::sink(std::unique_ptr<operator_data> output_data,
                                     rmm::cuda_stream_view stream)
 {
-  for (auto& batch : output_data->get_data_batches()) {
-    for (auto& [next_op, port_id] : next_port_after_sink) {
-      next_op->push_data_batch(port_id, batch);
+  auto pipelineable_data = pipelineable_operator_data::from_operator_data(std::move(output_data));
+  if (pipelineable_data) {
+    for (auto& batch : pipelineable_data->get_data_batches()) {
+      for (auto& [next_op, port_id] : next_port_after_sink) {
+        next_op->push_data_batch(port_id, batch);
+      }
     }
   }
 }

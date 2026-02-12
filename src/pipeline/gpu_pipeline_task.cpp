@@ -148,7 +148,7 @@ void gpu_pipeline_task::publish_output(std::unique_ptr<op::operator_data> output
   auto sink_operators =
     _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_sink();
   if (sink_operators) {
-    sink_operators.get()->sink(std::move(output_data), stream);
+    sink_operators.get()->sink(output_data, stream);
   } else {
     throw std::runtime_error("Sink operator not found");
   }

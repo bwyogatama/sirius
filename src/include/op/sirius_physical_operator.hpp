@@ -34,8 +34,10 @@
 #include <cucascade/data/data_repository.hpp>
 
 #include <atomic>
+#include <memory>
 #include <optional>
 #include <string_view>
+#include <type_traits>
 
 namespace sirius {
 
@@ -66,47 +68,58 @@ struct task_creation_hint {
  */
 class operator_data {
  public:
-  operator_data() = default;
-  explicit operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
-    : _data_batches(std::move(data_batches))
-  {
+  virtual ~operator_data() = default;
+};
+
+class pipelineable_operator_data : public operator_data {
+ public:
+  static std::unique_ptr<pipelineable_operator_data> create(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches) {
+    return std::unique_ptr<pipelineable_operator_data>(new pipelineable_operator_data(std::move(data_batches)));
   }
 
-  virtual ~operator_data() = default;
-
   /**
-   * @brief Get mutable data batches.
-   * @return Mutable reference to vector of data batch pointers
-   */
+  * @brief Get mutable data batches.
+  * @return Mutable reference to vector of data batch pointers
+  */
   [[nodiscard]] const std::vector<std::shared_ptr<::cucascade::data_batch>>& get_data_batches()
-    const
+  const
   {
     return _data_batches;
   }
 
- private:
-  std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
-};
+  protected:
+   pipelineable_operator_data() = default;
+   explicit pipelineable_operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
+     : _data_batches(std::move(data_batches))
+   {
+   }
+ 
+   virtual ~pipelineable_operator_data() = default;
+ 
+  private:
+   std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
+ };
 
 /**
  * @brief Container for partitioned operator data.
  *
  * Extends operator_data to include partition index information.
  */
-class partitioned_operator_data : public operator_data {
+class partitioned_operator_data : public pipelineable_operator_data {
  public:
-  partitioned_operator_data() = default;
+  static std::unique_ptr<partitioned_operator_data> create(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
+                                                           std::size_t partition_idx) {
+    return std::unique_ptr<partitioned_operator_data>(new partitioned_operator_data(std::move(data_batches), partition_idx));
+  }
+
+ protected:
   partitioned_operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
                             std::size_t partition_idx)
-    : operator_data(std::move(data_batches)), _partition_idx(partition_idx)
+    : pipelineable_operator_data(std::move(data_batches)), _partition_idx(partition_idx)
   {
   }
 
-  /**
-   * @brief Get the partition index.
-   * @return Partition index
-   */
-  [[nodiscard]] std::size_t get_partition_idx() const { return _partition_idx; }
+  virtual ~partitioned_operator_data() = default;
 
  private:
   std::size_t _partition_idx = 0;
@@ -182,6 +195,8 @@ class sirius_physical_operator {
 
   virtual std::unique_ptr<operator_data> execute(std::unique_ptr<operator_data> input_data,
                                                  rmm::cuda_stream_view stream);
+
+  virtual std::unique_ptr<operator_data> prepare_input(std::unique_ptr<operator_data> input_data);
 
   //! The influence the operator has on order (insertion order means no influence)
   virtual duckdb::OrderPreservationType operator_order() const
