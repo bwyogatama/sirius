@@ -42,10 +42,11 @@ sirius_physical_streaming_limit::sirius_physical_streaming_limit(
 {
 }
 
-operator_data sirius_physical_streaming_limit::execute(const operator_data& input_data,
-                                                       rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
+  std::unique_ptr<operator_data> input_data, rmm::cuda_stream_view stream)
 {
-  const auto& input_batches = input_data.get_data_batches();
+  auto pipelineable_data = input_data->cast_to<pipelineable_operator_data>();
+  const auto& input_batches = pipelineable_data->get_data_batches();
   SIRIUS_LOG_DEBUG("Executing streaming limit");
 
   if (limit_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE) {
@@ -96,7 +97,7 @@ operator_data sirius_physical_streaming_limit::execute(const operator_data& inpu
     offset_const = 0;  // offset only applies to the first batch with rows
   }
 
-  return operator_data(output_batches);
+  return pipelineable_operator_data::create(output_batches);
 }
 
 }  // namespace op
