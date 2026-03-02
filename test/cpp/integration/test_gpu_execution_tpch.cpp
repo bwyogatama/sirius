@@ -62,7 +62,8 @@ class GPUExecutionFixtureBase {
   GPUExecutionFixtureBase()
   {
     // Set up environment variable for config file
-    auto cfg_path = fs::path(__FILE__).parent_path() / "integration.cfg";
+    const char* env = std::getenv("SIRIUS_INTEGRATION_TEST_CONFIG");
+    auto cfg_path   = env ? fs::path(env) : fs::path(__FILE__).parent_path() / "integration.cfg";
     REQUIRE(fs::exists(cfg_path));
     config_guard = std::make_unique<sirius_config_env_guard>(cfg_path.string());
 
