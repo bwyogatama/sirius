@@ -32,8 +32,8 @@ struct configuration_setter;
 
 constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE   = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_SCAN_TASK_VARCHAR_SIZE = 256LL;
-constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES   = 100ULL * 1024 * 1024;  // 100 MB
-constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES     = 100ULL * 1024 * 1024;  // 100 MB
+constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES   = 512ULL * 1024 * 1024;  // 512 MB
+constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES     = 512ULL * 1024 * 1024;  // 512 MB
 
 }  // namespace config
 
@@ -81,6 +81,15 @@ struct sirius_config {
 
   [[nodiscard]] bool is_scan_caching_enabled() const noexcept { return _enable_scan_caching; }
 
+  [[nodiscard]] bool is_cache_decoded_table_enabled() const noexcept
+  {
+    return _cache_decoded_table;
+  }
+
+  [[nodiscard]] bool is_cache_in_gpu_enabled() const noexcept { return _cache_in_gpu; }
+
+  void set_cache_in_gpu(bool enabled) noexcept { _cache_in_gpu = enabled; }
+
   [[nodiscard]] const operator_params& get_operator_params() const noexcept
   {
     return _operator_params;
@@ -100,6 +109,8 @@ struct sirius_config {
   exec::thread_pool_config _duckdb_scan_executor_config{.num_threads        = 4,
                                                         .thread_name_prefix = "duckdb_scan"};
   bool _enable_scan_caching = false;
+  bool _cache_decoded_table = false;
+  bool _cache_in_gpu        = false;
   operator_params _operator_params;
 };
 
