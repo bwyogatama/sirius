@@ -21,15 +21,34 @@
 
 // sirius
 #include <exec/config.hpp>
+#include <exec/thread_pool.hpp>
+#include <helper/logical_type.hpp>
 #include <helper/type_conversions.hpp>
+#include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <parallel/task_executor.hpp>
+#include <scan_manager/parquet_split_provider.hpp>
+#include <scan_manager/split_connector.hpp>
+
+// Phase 19 IO-15: include test_helpers_ioctx.hpp LAST among sirius/test
+// headers — it transitively pulls liburing.h via uring_ioctx.hpp ->
+// uring_reactor.hpp, and liburing.h defines a BLOCK_SIZE macro that collides
+// with the BLOCK_SIZE static member in <blockingconcurrentqueue.h> (transitively
+// pulled via utils/utils.hpp -> sirius_context.hpp -> task_creator.hpp ->
+// bounded_thread_pool.hpp). All consumers of blockingconcurrentqueue.h must
+// precede this include. Mirrors src/op/scan/parquet_scan_task.cpp:30-35.
+#include <scan/test_helpers_ioctx.hpp>
 
 // cucascade
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
+// sirius IO framework (Phase 19 IO-15 helper preparation)
+#include <io/types.hpp>
+#include <io/uring/uring_ioctx.hpp>
+
 // rmm
+#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 
 // cudf
@@ -51,8 +70,11 @@
 #include <algorithm>
 #include <cstddef>
 #include <filesystem>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
 using namespace sirius;
 using namespace sirius::scan_test_utils;
@@ -91,6 +113,11 @@ class scan_test_executor : public sirius::parallel::itask_executor {
     }
   }
 };
+
+// Phase 22.1 D-08: make_test_gpu_ioctxs() lifted into shared header
+// scan/test_helpers_ioctx.hpp so that test_parquet_split_provider.cpp can
+// reuse the same helper. Uses sirius::scan_test_utils::make_test_gpu_ioctxs.
+using sirius::scan_test_utils::make_test_gpu_ioctxs;
 
 static std::unique_ptr<sirius::op::sirius_physical_parquet_scan> make_parquet_scan(
   duckdb::ClientContext& ctx,
@@ -372,7 +399,7 @@ static void run_parquet_scan_test(std::string const& table_name,
   REQUIRE(physical_scan);
 
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size);
+    nullptr, physical_scan.get(), batch_size, make_test_gpu_ioctxs());
 
   cucascade::shared_data_repository data_repo;
 
@@ -470,7 +497,7 @@ static void run_multi_file_parquet_scan_test(
   REQUIRE(physical_scan);
 
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size);
+    nullptr, physical_scan.get(), batch_size, make_test_gpu_ioctxs());
 
   cucascade::shared_data_repository data_repo;
 
@@ -554,7 +581,7 @@ static void run_parquet_scan_test_with_filter(
   REQUIRE(physical_scan);
 
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size);
+    nullptr, physical_scan.get(), batch_size, make_test_gpu_ioctxs());
 
   cucascade::shared_data_repository data_repo;
 
@@ -589,8 +616,10 @@ static void run_parquet_scan_test_with_filter(
     return batches;
   };
 
+  // HYG-02: use an explicit local stream instead of the default-stream sentinel.
+  rmm::cuda_stream validator_stream;
   auto batches = run_scan();
-  validator(batches, expected_rows, mem_mgr, rmm::cuda_stream_default);
+  validator(batches, expected_rows, mem_mgr, validator_stream.view());
 
   auto commit_result = con.Query("COMMIT");
   REQUIRE(commit_result);
@@ -614,7 +643,7 @@ static size_t count_row_group_partitions(
   REQUIRE(physical_scan);
 
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size);
+    nullptr, physical_scan.get(), batch_size, make_test_gpu_ioctxs());
   return global_state->get_num_row_group_partitions();
 }
 
@@ -946,4 +975,169 @@ TEST_CASE("parquet_scan_task - filter prunes row groups with multi-column compar
       table_filters->PushFilter(duckdb::ColumnIndex(1), std::move(val_filter));  // value column
       return table_filters;
     });
+}
+
+TEST_CASE("parquet_split_provider - FLBA decimal skips filter pushdown",
+          "[parquet_scan_task][filter][flba_decimal][scan]")
+{
+  // DECIMAL(25,2) forces DuckDB's parquet writer to use FIXED_LEN_BYTE_ARRAY
+  // physical type (p > 18 exceeds INT64 capacity). cudf's row-group stats
+  // filter throws "Invalid type and stats combination" when comparing a
+  // fixed_point_scalar against FLBA stats. The split provider must detect
+  // this via the schema probe and set disable_filter_pushdown on every
+  // emitted parquet_scan_data. The filter still applies post-decode.
+  auto const dir = std::filesystem::temp_directory_path() / "psp_flba_test";
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+  std::filesystem::create_directories(dir);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  constexpr size_t k_rows    = 10000;
+  constexpr size_t k_rg_size = 5000;
+  std::string const table    = "psp_flba_tmp";
+  auto result                = con.Query("CREATE TABLE " + table +
+                          " AS SELECT (range)::INTEGER AS id, "
+                                         "CAST(range * 1.25 AS DECIMAL(25,2)) AS amount "
+                                         "FROM range(0, " +
+                          std::to_string(k_rows) + ")");
+  REQUIRE(result);
+  REQUIRE(!result->HasError());
+
+  auto const path = dir / "flba.parquet";
+  result          = con.Query("COPY " + table + " TO '" + path.string() +
+                     "' (FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE " +
+                     std::to_string(k_rg_size) + ")");
+  REQUIRE(result);
+  REQUIRE(!result->HasError());
+  con.Query("DROP TABLE " + table);
+
+  // Build a filter on the decimal column: amount < 6250.00
+  auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+  table_filters->PushFilter(duckdb::ColumnIndex(1),
+                            duckdb::make_uniq<duckdb::ConstantFilter>(
+                              duckdb::ExpressionType::COMPARE_LESSTHAN,
+                              duckdb::Value::DECIMAL(static_cast<int64_t>(625000), 25, 2)));
+
+  duckdb::vector<sirius::logical_type> types = {
+    sirius::logical_type::make(sirius::type_id::INTEGER),
+    sirius::logical_type::make_decimal(25, 2),
+  };
+  duckdb::vector<duckdb::ColumnIndex> col_ids = {duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
+
+  sirius::scan_manager::parquet_split_provider provider(
+    types,
+    {path.string()},
+    col_ids,
+    /*projection_ids*/ {},
+    {"id", "amount"},
+    /*scan_output_arity*/ types.size(),
+    std::move(table_filters),
+    /*partition_indices*/ {},
+    /*approximate_batch_size*/ std::size_t{1} << 30,
+    /*max_file_processed*/ 10,
+    sirius::scan_test_utils::make_test_gpu_ioctxs());
+
+  sirius::exec::static_thread_pool pool(2, "flba_pool");
+  sirius::scan_manager::split_connector connector;
+  provider.run(pool, connector);
+
+  std::vector<std::unique_ptr<sirius::op::scan::parquet_scan_data>> splits;
+  while (true) {
+    auto next = connector.get_next_split();
+    if (!next.has_value()) { break; }
+    auto* raw     = next->release();
+    auto* parquet = dynamic_cast<sirius::op::scan::parquet_scan_data*>(raw);
+    REQUIRE(parquet != nullptr);
+    splits.emplace_back(parquet);
+  }
+  REQUIRE_FALSE(splits.empty());
+
+  for (auto const& split : splits) {
+    INFO("Every split from an FLBA-decimal file must have disable_filter_pushdown set");
+    REQUIRE(split->disable_filter_pushdown);
+  }
+
+  std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("parquet_split_provider - INT64 decimal allows filter pushdown",
+          "[parquet_scan_task][filter][flba_decimal][scan]")
+{
+  // DECIMAL(10,2) fits in INT64 physical type — the probe must NOT disable
+  // filter pushdown. Complement of the FLBA test above.
+  auto const dir = std::filesystem::temp_directory_path() / "psp_int64dec_test";
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+  std::filesystem::create_directories(dir);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  constexpr size_t k_rows    = 10000;
+  constexpr size_t k_rg_size = 5000;
+  std::string const table    = "psp_int64dec_tmp";
+  auto result                = con.Query("CREATE TABLE " + table +
+                          " AS SELECT (range)::INTEGER AS id, "
+                                         "CAST(range * 1.25 AS DECIMAL(10,2)) AS amount "
+                                         "FROM range(0, " +
+                          std::to_string(k_rows) + ")");
+  REQUIRE(result);
+  REQUIRE(!result->HasError());
+
+  auto const path = dir / "int64dec.parquet";
+  result          = con.Query("COPY " + table + " TO '" + path.string() +
+                     "' (FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE " +
+                     std::to_string(k_rg_size) + ")");
+  REQUIRE(result);
+  REQUIRE(!result->HasError());
+  con.Query("DROP TABLE " + table);
+
+  auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+  table_filters->PushFilter(duckdb::ColumnIndex(1),
+                            duckdb::make_uniq<duckdb::ConstantFilter>(
+                              duckdb::ExpressionType::COMPARE_LESSTHAN,
+                              duckdb::Value::DECIMAL(static_cast<int64_t>(625000), 10, 2)));
+
+  duckdb::vector<sirius::logical_type> types = {
+    sirius::logical_type::make(sirius::type_id::INTEGER),
+    sirius::logical_type::make_decimal(10, 2),
+  };
+  duckdb::vector<duckdb::ColumnIndex> col_ids = {duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
+
+  sirius::scan_manager::parquet_split_provider provider(
+    types,
+    {path.string()},
+    col_ids,
+    /*projection_ids*/ {},
+    {"id", "amount"},
+    /*scan_output_arity*/ types.size(),
+    std::move(table_filters),
+    /*partition_indices*/ {},
+    /*approximate_batch_size*/ std::size_t{1} << 30,
+    /*max_file_processed*/ 10,
+    sirius::scan_test_utils::make_test_gpu_ioctxs());
+
+  sirius::exec::static_thread_pool pool(2, "i64dec_pool");
+  sirius::scan_manager::split_connector connector;
+  provider.run(pool, connector);
+
+  std::vector<std::unique_ptr<sirius::op::scan::parquet_scan_data>> splits;
+  while (true) {
+    auto next = connector.get_next_split();
+    if (!next.has_value()) { break; }
+    auto* raw     = next->release();
+    auto* parquet = dynamic_cast<sirius::op::scan::parquet_scan_data*>(raw);
+    REQUIRE(parquet != nullptr);
+    splits.emplace_back(parquet);
+  }
+  REQUIRE_FALSE(splits.empty());
+
+  for (auto const& split : splits) {
+    INFO("INT64-decimal files should allow filter pushdown");
+    REQUIRE_FALSE(split->disable_filter_pushdown);
+  }
+
+  std::filesystem::remove_all(dir);
 }

@@ -20,6 +20,7 @@
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
+#include "op/cudf_sort_order.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
 
@@ -27,12 +28,20 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <functional>
+
 namespace sirius {
 namespace op {
 
-sirius_physical_sort_sample::sirius_physical_sort_sample(sirius_physical_order* order_by)
-  : sirius_physical_sort_sample(
-      order_by->types, copy_orders(order_by->orders), order_by->estimated_cardinality)
+sirius_physical_sort_sample::sirius_physical_sort_sample(sirius_physical_order* order_by,
+                                                         uint64_t max_partition_bytes,
+                                                         double max_partition_memory_fraction)
+  : sirius_physical_sort_sample(order_by->types,
+                                copy_orders(order_by->orders),
+                                order_by->estimated_cardinality,
+                                DEFAULT_NUM_SAMPLE_BATCHES,
+                                max_partition_bytes,
+                                max_partition_memory_fraction)
 {
 }
 
@@ -40,11 +49,15 @@ sirius_physical_sort_sample::sirius_physical_sort_sample(
   duckdb::vector<sirius::logical_type> types,
   duckdb::vector<duckdb::BoundOrderByNode> orders,
   std::size_t estimated_cardinality,
-  std::size_t num_sample_batches)
+  std::size_t num_sample_batches,
+  uint64_t max_partition_bytes,
+  double max_partition_memory_fraction)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::SORT_SAMPLE, std::move(types), estimated_cardinality),
     orders(std::move(orders)),
-    num_sample_batches(num_sample_batches)
+    num_sample_batches(num_sample_batches),
+    _max_partition_bytes_override(max_partition_bytes),
+    _max_partition_memory_fraction(max_partition_memory_fraction)
 {
 }
 
@@ -82,22 +95,22 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_sort_sample::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_data_batches();
+  const auto& input_batches = input.get_read_only_batches();
 
   // Fast path: boundaries already computed — just pass through.
   if (_boundary_state.load(std::memory_order_acquire) == 2) {
     SIRIUS_LOG_DEBUG("Sort sample: passthrough ({} batches)", input_batches.size());
-    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
 
   // Elect exactly one winner via CAS (0=not started → 1=computing).
   // The task_creator's while loop dispatches one task per batch, so multiple tasks
   // can be in-flight simultaneously. Losers passthrough without blocking — they don't
-  // need the boundaries themselves; sort_partition accesses them in a later pipeline.
+  // need the boundaries themselves; sort_partition runs next in the same pipeline task.
   int expected = 0;
   if (!_boundary_state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
     SIRIUS_LOG_DEBUG("Sort sample: passthrough ({} batches)", input_batches.size());
-    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
 
   SIRIUS_LOG_DEBUG("Sort sample: computing partition boundaries from {} batches",
@@ -105,17 +118,16 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   auto start = std::chrono::high_resolution_clock::now();
 
   // 1. Collect valid batches and find memory space
-  std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
+  std::vector<::cucascade::read_only_data_batch> valid_batches;
   cucascade::memory::memory_space* space = nullptr;
   for (auto const& batch : input_batches) {
-    if (!batch) { continue; }
-    if (!space) { space = batch->get_memory_space(); }
+    if (!space) { space = batch.get_memory_space(); }
     valid_batches.push_back(batch);
   }
 
   if (valid_batches.empty() || !space) {
     _boundary_state.store(2, std::memory_order_release);
-    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
 
   // Wrap GPU work in try/catch: if any allocation throws (e.g. rmm::out_of_memory),
@@ -126,9 +138,9 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     size_t total_sample_bytes = 0;
     sample_views.reserve(valid_batches.size());
     for (auto const& batch : valid_batches) {
-      auto view = get_cudf_table_view(*batch);
+      auto view = get_cudf_table_view(batch);
       sample_views.push_back(view);
-      total_sample_bytes += batch->get_data()->get_size_in_bytes();
+      total_sample_bytes += batch.get_data()->get_size_in_bytes();
     }
 
     auto concat_table = cudf::concatenate(sample_views, stream, space->get_default_allocator());
@@ -147,11 +159,8 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
       }
       auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
       order_key_idx.push_back(idx);
-      column_order.push_back(ord.type == duckdb::OrderType::ASCENDING ? cudf::order::ASCENDING
-                                                                      : cudf::order::DESCENDING);
-      null_precedence.push_back(ord.null_order == duckdb::OrderByNullType::NULLS_FIRST
-                                  ? cudf::null_order::BEFORE
-                                  : cudf::null_order::AFTER);
+      column_order.push_back(to_cudf_order(ord.type));
+      null_precedence.push_back(to_cudf_null_order(ord.type, ord.null_order));
     }
 
     // 4. Sort the concatenated sample by sort keys
@@ -190,7 +199,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
       size_t max_partition_bytes   = _max_partition_bytes_override > 0
                                        ? _max_partition_bytes_override
                                        : static_cast<size_t>(static_cast<double>(available_memory) *
-                                                           MAX_PARTITION_MEMORY_FRACTION);
+                                                           _max_partition_memory_fraction);
 
       if (max_partition_bytes > 0 && estimated_total_bytes > max_partition_bytes) {
         num_parts = (estimated_total_bytes + max_partition_bytes - 1) / max_partition_bytes;
@@ -255,10 +264,8 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
       _num_partitions       = num_parts;
     }
 
-    // Pipeline framework calls stream.synchronize() after execute() returns, before
-    // publish_output(). Pipeline C only starts after all Pipeline B tasks complete,
-    // so _partition_boundaries is fully materialized on the GPU before sort_partition
-    // ever reads it. No explicit sync needed here.
+    // sort_partition runs in the same gpu_pipeline_task immediately after this
+    // execute() returns, so _partition_boundaries is visible before partition runs.
     _boundary_state.store(2, std::memory_order_release);
 
   } catch (...) {
@@ -275,7 +282,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
                    _partition_boundaries ? _partition_boundaries->num_rows() : 0,
                    duration.count() / 1000.0);
 
-  return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+  return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
 }
 
 }  // namespace op

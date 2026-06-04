@@ -15,15 +15,19 @@
  */
 
 #define CATCH_CONFIG_RUNNER
-
+#define CATCH_CONFIG_NO_POSIX_SIGNALS
 #include "catch.hpp"
 #include "config.hpp"
 #include "log/logging.hpp"
+#include "util/segfault_backtrace.hpp"
 #include "utils/sirius_test_env.hpp"
+
+#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+#include <optional>
 #include <string>
 
 using namespace duckdb;
@@ -69,6 +73,12 @@ struct shared_env_listener : Catch::TestEventListenerBase {
         sirius::test::g_integration_env->is_active()) {
       sirius::test::g_integration_env->pause();
     }
+    // The 2-GPU integration env is switched on/off by the TEST_CASE body via
+    // acquire_integration_env_for(2); the listener only ensures it's paused
+    // between tests so it never holds the extension lock unexpectedly.
+    if (sirius::test::g_integration_env_2gpu && sirius::test::g_integration_env_2gpu->is_active()) {
+      sirius::test::g_integration_env_2gpu->pause();
+    }
 
     // Resume the environment this test needs
     if (needs == env_need::SHARED && sirius::test::g_shared_env &&
@@ -86,6 +96,10 @@ CATCH_REGISTER_LISTENER(shared_env_listener)
 
 int main(int argc, char* argv[])
 {
+  // Install the crash backtrace handler up front so it covers the whole test
+  // run, independent of when (or whether) the extension's LoadInternal runs.
+  sirius::util::install_segfault_backtrace_handler();
+
   // Initialize the logger
   std::string log_dir = SIRIUS_UNITTEST_LOG_DIR;
   Config::LOG_DIR     = log_dir;
@@ -107,12 +121,28 @@ int main(int argc, char* argv[])
   integration_env.pause();
   sirius::test::g_integration_env = &integration_env;
 
+  // 2-GPU integration env (TEST-01/02 v1.2). Starts paused; TEST_CASE bodies
+  // that parameterize on num_gpus via GENERATE(1, 2) pick this env up via
+  // sirius::test::acquire_integration_env_for(2) and call resume()/pause()
+  // around each call to compare_gpu_vs_cpu.
+  auto integration_config_2gpu_path = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" /
+                                      "integration" / "integration-2gpu.yaml";
+  int _dev_count = 0;
+  cudaGetDeviceCount(&_dev_count);
+  std::optional<sirius::test::shared_test_env> integration_env_2gpu_holder;
+  if (_dev_count >= 2) {
+    integration_env_2gpu_holder.emplace(integration_config_2gpu_path);
+    integration_env_2gpu_holder->pause();
+    sirius::test::g_integration_env_2gpu = &(*integration_env_2gpu_holder);
+  }
+
   Catch::Session session;
   session.applyCommandLine(argc, argv);
   int result = session.run();
 
-  sirius::test::g_integration_env = nullptr;
-  sirius::test::g_shared_env      = nullptr;
+  sirius::test::g_integration_env_2gpu = nullptr;
+  sirius::test::g_integration_env      = nullptr;
+  sirius::test::g_shared_env           = nullptr;
 
   std::fflush(stdout);
   std::fflush(stderr);

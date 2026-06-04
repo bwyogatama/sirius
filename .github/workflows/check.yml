@@ -24,14 +24,14 @@ jobs:
   lint:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
 
-      - uses: prefix-dev/setup-pixi@1b2de7f3351f171c8b4dfeb558c639cb58ed4ec0 # v0.9.5
+      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
         with:
           cache: false
-          pixi-version: v0.65.0
+          pixi-version: v0.70.1
           global-environments: |
             pre-commit
 
@@ -39,92 +39,142 @@ jobs:
 
   build:
     env:
-      SCCACHE_GHA_ENABLED: true
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
     strategy:
       matrix:
-        arch:
-          - x64
-          - arm64
-        compiler:
-          - gcc
-          - clang
-        build-type:
-          - release
-          - debug
-        environment: [default]
-        cudf-channel:
-          - stable
-        variant: [super]
-        exclude:
-          - compiler: gcc
-            build-type: debug
-          - compiler: clang
+        build:
+          - arch: x64
+            compiler: gcc
             build-type: release
-        include:
+            environment: default
+            cudf-channel: stable
+            variant: super
+            run-on-pr: true
+          - arch: x64
+            compiler: clang
+            build-type: debug
+            environment: default
+            cudf-channel: stable
+            variant: super
+            run-on-pr: true
+          - arch: arm64
+            compiler: gcc
+            build-type: release
+            environment: default
+            cudf-channel: stable
+            variant: super
+            run-on-pr: false
+          - arch: arm64
+            compiler: clang
+            build-type: debug
+            environment: default
+            cudf-channel: stable
+            variant: super
+            run-on-pr: false
           - arch: x64
             compiler: gcc
             build-type: release
             environment: vcpkg
             cudf-channel: stable
             variant: super
-          #- arch: arm64
-          #  compiler: gcc
-          #  build-type: release
-          #  environment: default
-          #  cudf-channel: nightly
-          #  variant: super
+            run-on-pr: false
+          - arch: arm64
+            compiler: gcc
+            build-type: release
+            environment: default
+            cudf-channel: nightly
+            variant: super
+            run-on-pr: false
           - arch: x64
             compiler: gcc
             build-type: release
             environment: default
             cudf-channel: stable
             variant: legacy
+            run-on-pr: false
+        exclude:
+          # On PRs, drop rows marked merge/dev-only; on merge_group/dev, match nothing.
+          - build:
+              run-on-pr: ${{ fromJSON(github.event_name == 'pull_request' && 'false' || 'null') }}
       fail-fast: false
+    name: build (${{ matrix.build.arch }}, ${{ matrix.build.compiler }}, ${{ matrix.build.build-type }}, ${{ matrix.build.environment }}, ${{ matrix.build.cudf-channel }}, ${{ matrix.build.variant }})
     runs-on: >-
-      ${{ matrix.environment == 'vcpkg'
-        && fromJSON('["self-hosted", "ubuntu-22.04", "cuda-13", "cpu-xl-spot"]')
-        || format('ubuntu-24.04{0}', case(matrix.arch == 'arm64', '-arm', '')) }}
-    timeout-minutes: ${{ case(matrix.environment == 'vcpkg', 240, 60) }}
-    continue-on-error: ${{ matrix.cudf-channel == 'nightly' }}
+      ${{ matrix.build.environment == 'vcpkg'
+        && fromJSON('["self-hosted", "ubuntu-24.04", "cpu-xl"]')
+        || matrix.build.arch == 'x64'
+        && fromJSON('["self-hosted", "ubuntu-24.04", "cpu-lg"]')
+        || matrix.build.arch == 'arm64'
+        && fromJSON('["self-hosted", "ubuntu-24.04", "arm-lg"]') }}
+    timeout-minutes: ${{ case(matrix.build.environment == 'vcpkg', 240, 60) }}
+    continue-on-error: ${{ matrix.build.cudf-channel == 'nightly' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
 
       - name: Unshallow vcpkg for version overrides
-        if: matrix.environment == 'vcpkg'
+        if: matrix.build.environment == 'vcpkg'
         run: git -C vcpkg rev-parse --is-shallow-repository | grep -q true && git -C vcpkg fetch --unshallow || true
 
-      - uses: prefix-dev/setup-pixi@1b2de7f3351f171c8b4dfeb558c639cb58ed4ec0 # v0.9.5
+      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
         with:
           cache: false
-          pixi-version: v0.65.0
-          activate-environment: ${{ matrix.environment != 'vcpkg' && matrix.cudf-channel != 'nightly' }}
+          pixi-version: v0.70.1
+          activate-environment: ${{ matrix.build.environment != 'vcpkg' && matrix.build.cudf-channel != 'nightly' }}
           environments: >-
-            ${{ matrix.cudf-channel == 'nightly' && 'nightly-runner'
-              || matrix.environment }}
+            ${{ matrix.build.cudf-channel == 'nightly' && 'nightly-runner'
+              || matrix.build.environment }}
+
+      - name: Configure cache backends
+        run: |
+          if [[ -n "${SCCACHE_BUCKET}" ]]; then
+            echo "SCCACHE_BUCKET DEFINED -> Self Hosted Runner, Disable GHA sccache, use S3 vcpkg cache"
+            echo "SCCACHE_GHA_ENABLED=false" >> $GITHUB_ENV
+          else
+            echo "SCCACHE_BUCKET UNDEFINED -> GitHub Runner, Enable GHA sccache"
+            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+          fi
+          if [[ -n "${VCPKG_BUCKET}" ]]; then
+            echo "VCPKG_BINARY_SOURCES=clear;x-aws,s3://${VCPKG_BUCKET}/,readwrite" >> $GITHUB_ENV
+          fi
 
       - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
-      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        if: matrix.environment == 'vcpkg'
-        with:
-          path: ~/.cache/vcpkg/archives
-          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ matrix.environment }}-${{ hashFiles('vcpkg.json', 'vcpkg/versions/baseline.json', 'vcpkg_ports/**', 'vcpkg_triplets/**', 'cmake/CMakePresets.json', 'pixi.lock') }}
-          restore-keys: |
-            vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ matrix.environment }}-
-            vcpkg-${{ runner.os }}-${{ runner.arch }}-
-
-      - run: ${{ case(matrix.cudf-channel == 'nightly', 'pixi run -e nightly-runner nightly-run', '') }} make ${{ matrix.variant == 'legacy' && format('legacy-{0}', matrix.build-type) || case(matrix.compiler == 'gcc', matrix.build-type, format('clang-{0}', matrix.build-type)) }} -j$(nproc)
-        if: matrix.environment != 'vcpkg'
+      - run: ${{ case(matrix.build.cudf-channel == 'nightly', 'pixi run -e nightly-runner nightly-run', '') }} make ${{ matrix.build.variant == 'legacy' && format('legacy-{0}', matrix.build.build-type) || case(matrix.build.compiler == 'gcc', matrix.build.build-type, format('clang-{0}', matrix.build.build-type)) }} -j$(nproc)
+        if: matrix.build.environment != 'vcpkg'
         env:
           CUDAARCHS: "100"
 
       - name: Build (vcpkg)
-        if: matrix.environment == 'vcpkg'
+        if: matrix.build.environment == 'vcpkg'
         run: |
-          pixi run -e vcpkg cmake -S duckdb --preset vcpkg-release
-          pixi run -e vcpkg cmake --build build/vcpkg-release --target duckdb duckdb_local_extension_repo sirius_unittest
+          set -o pipefail
+          pixi run -e vcpkg cmake -S duckdb --preset vcpkg-release 2>&1 | tee /tmp/vcpkg.log
+          pixi run -e vcpkg cmake --build build/vcpkg-release --target duckdb duckdb_local_extension_repo sirius_unittest 2>&1 | tee -a /tmp/vcpkg.log
+
+      - name: vcpkg cache summary
+        if: matrix.build.environment == 'vcpkg' && always()
+        run: |
+          [ -f /tmp/vcpkg.log ] || exit 0
+          RESTORED=$(grep -oP 'Restored \K\d+(?= package)' /tmp/vcpkg.log | head -1)
+          RESTORED=${RESTORED:-0}
+          RESTORE_TIME=$(grep -oP 'from AWS in \K[\d.]+(?= min)' /tmp/vcpkg.log | head -1)
+          TOTAL=$(grep -oP 'Installing \d+/\K\d+' /tmp/vcpkg.log | tail -1)
+          BUILT=$((${TOTAL:-0} - ${RESTORED:-0}))
+          UPLOADED=$(grep -c 'Starting submission' /tmp/vcpkg.log || true)
+          BUILD_MS=$(grep -oP 'Elapsed time to handle [^:]+: \K[\d.]+(?= ms)' /tmp/vcpkg.log | awk '{s+=$1} END {printf "%.1f", s/1000}')
+          HIT_RATE=$(( TOTAL > 0 ? RESTORED * 100 / TOTAL : 0 ))
+          {
+            echo "## vcpkg cache stats"
+            echo "| Metric | Value |"
+            echo "|---|---|"
+            echo "| Cache hit % | **${HIT_RATE}%** |"
+            echo "| Restored from S3 | **${RESTORED}** packages${RESTORE_TIME:+ in ${RESTORE_TIME} min} |"
+            echo "| Built from source | **${BUILT}** packages |"
+            echo "| Uploaded to S3 | **${UPLOADED}** packages |"
+            [ "${BUILT}" -gt 0 ] && echo "| Build time | **${BUILD_MS}** s |" || true
+          } >> "$GITHUB_STEP_SUMMARY"
 
   check:
     runs-on: ubuntu-slim
@@ -132,8 +182,8 @@ jobs:
     if: always()
     steps:
       - name: All checks ok
-        if: ${{ !(contains(needs.*.result, 'failure')) }}
+        if: ${{ needs.lint.result == 'success' && needs.build.result == 'success' }}
         run: exit 0
       - name: Some checks failed
-        if: ${{ contains(needs.*.result, 'failure') }}
+        if: ${{ !(needs.lint.result == 'success' && needs.build.result == 'success') }}
         run: exit 1

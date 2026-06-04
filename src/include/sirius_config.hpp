@@ -18,12 +18,15 @@
 
 #include "config.hpp"
 #include "exec/config.hpp"
+#include "io/object_store_config.hpp"
 #include "op/scan/config.hpp"
+#include "scan_manager/sirius_scan_manager.hpp"
 
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <filesystem>
+#include <string>
 
 namespace sirius {
 
@@ -34,6 +37,9 @@ constexpr uint64_t DEFAULT_SCAN_TASK_VARCHAR_SIZE     = 256LL;
 constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES       = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 500ULL * 1024 * 1024;  // 500 MB
+
+/// Fraction of available GPU memory used per sort partition when max_sort_partition_bytes is 0.
+constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
 
 }  // namespace config
 
@@ -47,8 +53,11 @@ struct operator_params {
   /// Default size estimate (bytes) for VARCHAR columns when computing rows per batch.
   uint64_t default_scan_task_varchar_size = config::DEFAULT_SCAN_TASK_VARCHAR_SIZE;
 
-  /// Maximum bytes per sort partition (0 = auto: 33% of available GPU memory).
+  /// Maximum bytes per sort partition (0 = auto based on max_sort_partition_memory_fraction).
   uint64_t max_sort_partition_bytes = 0;
+
+  /// Fraction of available GPU memory per sort partition when max_sort_partition_bytes is 0.
+  double max_sort_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION;
 
   /// Target size (bytes) per hash partition for joins and group-bys.
   uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES;
@@ -59,6 +68,17 @@ struct operator_params {
   /// Maximum build-side bytes for switching to BUILD_PROBE join mode.
   /// May be larger than concat_batch_bytes; build-side batches will be concatenated if needed.
   uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
+
+  /// Route DuckDB native `seq_scan` to the GPU-native scan operator
+  /// (sirius_gpu_duckdb_native_scan_operator) instead of the CPU fallback
+  /// (sirius_physical_duckdb_scan). Off by default.
+  bool enable_gpu_duckdb_native_scan = false;
+};
+
+struct telemetry_config {
+  bool enable_quent{false};
+  std::string output_directory{"telemetry_data"};
+  std::string engine_name{"siriusDB"};
 };
 
 struct sirius_config {
@@ -77,6 +97,13 @@ struct sirius_config {
   get_memory_space_configs() const noexcept;
 
   [[nodiscard]] const exec::thread_pool_config& get_task_creator_config() const noexcept;
+
+  [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;
+
+  /// Overwrite the stored scan_manager_config. SiriusContext::initialize() uses
+  /// this to persist the S3 backend it materialized from object_store_config,
+  /// so a later get_config() reflects the actual scan_manager wiring.
+  void set_scan_manager_config(scan_manager::scan_manager_config config) noexcept;
 
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
 
@@ -107,16 +134,31 @@ struct sirius_config {
 
   [[nodiscard]] operator_params& get_operator_params() noexcept { return _operator_params; }
 
+  [[nodiscard]] const telemetry_config& get_telemetry_config() const noexcept
+  {
+    return _telemetry_config;
+  }
+
+  /// Object-store backend credentials + endpoint. Empty fields disable the
+  /// S3 backend; SiriusContext::initialize() reads this to populate
+  /// scan_manager_config::s3_config before constructing the scan_manager.
+  /// Direct member access (no getter/setter) to keep the test fixture and
+  /// future SET-handler wiring simple — both sides write into this struct
+  /// and SiriusContext consumes it at initialize() time.
+  sirius::io::object_store_config object_store_config{};
+
  private:
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   exec::thread_pool_config _task_creator_config{.num_threads        = 2,
                                                 .thread_name_prefix = "task_creator"};
+  scan_manager::scan_manager_config _scan_manager_config{};
   exec::thread_pool_config _gpu_pipeline_executor_config{.num_threads        = 4,
                                                          .thread_name_prefix = "gpu_pipeline"};
   exec::downgrade_executor_config _downgrade_executor_config;
   op::scan::scan_executor_config _scan_executor_config;
   operator_params _operator_params;
+  telemetry_config _telemetry_config;
 };
 
 }  // namespace sirius

@@ -50,8 +50,6 @@
 #include <op/scan/sirius_parquet_metadata_scan_operator.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <pipeline/sirius_pipeline.hpp>
-#include <sirius_engine.hpp>
-#include <sirius_interface.hpp>
 
 // cucascade
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -79,15 +77,13 @@ namespace {
 //===----------------------------------------------------------------------===//
 
 /// Owns everything needed to construct real sirius_pipeline instances —
-/// engine, memory manager, gpu memory space. One fixture per test case so
+/// build context, memory manager, gpu memory space. One fixture per test case so
 /// each run starts from a clean state.
 struct pipeline_task_counting_fixture {
   pipeline_task_counting_fixture()
     : db(nullptr),
       con(db),
-      sirius_iface(*con.context),
       memory_manager(initialize_memory_manager()),
-      engine(*con.context, sirius_iface),
       gpu_space(get_space(*memory_manager, Tier::GPU))
   {
     REQUIRE(gpu_space != nullptr);
@@ -95,9 +91,8 @@ struct pipeline_task_counting_fixture {
 
   duckdb::DuckDB db;
   duckdb::Connection con;
-  sirius::sirius_interface sirius_iface;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager;
-  sirius::sirius_engine engine;
+  const sirius::pipeline::pipeline_build_context build_ctx{true};
   cucascade::memory::memory_space* gpu_space;
 };
 
@@ -181,14 +176,14 @@ struct pipeline_pair {
 ///   metadata_pipeline.parents = { gpu_pipeline }  — required so that
 ///     update_pipeline_status() on metadata_pipeline notifies the gpu pipeline
 ///     once it's done.
-pipeline_pair build_pipelines(sirius::sirius_engine& engine,
+pipeline_pair build_pipelines(const sirius::pipeline::pipeline_build_context& build_ctx,
                               sirius::op::scan::sirius_parquet_metadata_scan_operator& metadata_op,
                               sirius::op::scan::sirius_gpu_parquet_scan_operator& gpu_op)
 {
   using namespace sirius::pipeline;
 
-  auto metadata_pipeline = duckdb::make_shared_ptr<sirius_pipeline>(engine);
-  auto gpu_pipeline      = duckdb::make_shared_ptr<sirius_pipeline>(engine);
+  auto metadata_pipeline = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx);
+  auto gpu_pipeline      = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx);
 
   sirius_pipeline_build_state build_state;
   build_state.set_pipeline_source(*metadata_pipeline, metadata_op);
@@ -265,8 +260,8 @@ TEST_CASE("pipeline task counting - single file, default max_file_processed (one
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
-  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(sirius::from_duckdb_vec(schema.types),
-                                                            0);
+  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(
+    sirius::from_duckdb_vec(schema.types), 0, nullptr);
   sirius::op::scan::sirius_parquet_metadata_scan_operator metadata_op(
     &gpu_op,
     sirius::from_duckdb_vec(schema.types),
@@ -277,7 +272,7 @@ TEST_CASE("pipeline task counting - single file, default max_file_processed (one
     no_projection,
     schema.names);
 
-  auto [metadata_pipeline, gpu_pipeline] = build_pipelines(fixture.engine, metadata_op, gpu_op);
+  auto [metadata_pipeline, gpu_pipeline] = build_pipelines(fixture.build_ctx, metadata_op, gpu_op);
 
   // ----------- pipeline 1: metadata scan -----------
   auto metadata_tasks = simulate_task_creator_loop(
@@ -292,11 +287,6 @@ TEST_CASE("pipeline task counting - single file, default max_file_processed (one
   REQUIRE(metadata_pipeline->get_tasks_created() == 1);
   REQUIRE(metadata_pipeline->get_tasks_completed() == 1);
   REQUIRE(metadata_pipeline->is_pipeline_finished());
-
-  // Hand off to pipeline 2. In production this runs off the sink's
-  // finalize_operator(); update_pipeline_status() only walks get_operators(),
-  // so a single-op self-pipeline needs the engine to invoke it.
-  metadata_op.finalize_operator();
 
   // ----------- pipeline 2: gpu parquet scan -----------
   std::size_t gpu_tasks =
@@ -338,8 +328,8 @@ TEST_CASE("pipeline task counting - multi-file metadata scan with max_file_proce
   auto schema = synthetic_schema();
   duckdb::vector<duckdb::idx_t> no_projection;
 
-  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(sirius::from_duckdb_vec(schema.types),
-                                                            0);
+  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(
+    sirius::from_duckdb_vec(schema.types), 0, nullptr);
   sirius::op::scan::sirius_parquet_metadata_scan_operator metadata_op(
     &gpu_op,
     sirius::from_duckdb_vec(schema.types),
@@ -357,7 +347,7 @@ TEST_CASE("pipeline task counting - multi-file metadata scan with max_file_proce
   REQUIRE(metadata_op.get_max_file_processed() == 1);
   REQUIRE(metadata_op.get_total_files() == NUM_FILES);
 
-  auto [metadata_pipeline, gpu_pipeline] = build_pipelines(fixture.engine, metadata_op, gpu_op);
+  auto [metadata_pipeline, gpu_pipeline] = build_pipelines(fixture.build_ctx, metadata_op, gpu_op);
 
   // ----------- pipeline 1: per-file metadata tasks -----------
   // Each successful iteration of task_creator's loop advances the file
@@ -379,12 +369,8 @@ TEST_CASE("pipeline task counting - multi-file metadata scan with max_file_proce
   REQUIRE(metadata_pipeline->get_tasks_completed() == NUM_FILES);
   REQUIRE(metadata_pipeline->is_pipeline_finished());
 
-  // Bridge to pipeline 2 (see note in the single-file test).
-  metadata_op.finalize_operator();
-
-  // Before finalize the gpu op must have been "waiting" on the metadata
-  // pipeline via the handoff port; now that metadata is done,
-  // is_source_pipeline_finished() on gpu_op should report true.
+  // The metadata pipeline is finished; the gpu op detects this via the
+  // handoff port's src_pipeline->is_pipeline_finished().
   REQUIRE(gpu_op.is_source_pipeline_finished());
 
   // ----------- pipeline 2: gpu scan over all accumulated partitions -----------

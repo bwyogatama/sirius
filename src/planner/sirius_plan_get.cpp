@@ -24,6 +24,8 @@
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
+#include <unordered_set>
+
 namespace sirius::planner {
 
 duckdb::unique_ptr<duckdb::TableFilterSet> create_table_filter_set(
@@ -52,6 +54,15 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 {
   auto column_ids = op.GetColumnIds();
+
+  // Only GPU-route known table scan functions; all others (pragma, system catalog
+  // functions, etc.) must fall back to CPU.
+  static const std::unordered_set<std::string> kSupportedScanFunctions = {
+    "seq_scan", "parquet_scan", "read_parquet", "sirius_read_parquet", "iceberg_scan"};
+  if (kSupportedScanFunctions.find(op.function.name) == kSupportedScanFunctions.end()) {
+    throw duckdb::NotImplementedException("Table function '{}' is not supported in Sirius",
+                                          op.function.name);
+  }
 
   if (!op.children.empty()) {
     throw duckdb::NotImplementedException("Table Input Output functions are not supported yet");
@@ -162,6 +173,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       std::move(op.extra_info),
       std::move(op.parameters),
       std::move(op.virtual_columns));
+    node->named_parameters = std::move(op.named_parameters);
     // first check if an additional projection is necessary
     if (column_ids.size() == op.returned_types.size()) {
       bool projection_necessary = false;
@@ -221,7 +233,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     std::move(op.extra_info),
     std::move(op.parameters),
     std::move(op.virtual_columns));
-  node->dynamic_filters = op.dynamic_filters;
+  node->named_parameters = std::move(op.named_parameters);
+  node->dynamic_filters  = op.dynamic_filters;
   if (filter) {
     filter->children.push_back(std::move(node));
     return std::move(filter);

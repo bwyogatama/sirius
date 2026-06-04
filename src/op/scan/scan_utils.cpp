@@ -17,6 +17,7 @@
 // sirius
 #include <duckdb/planner/expression/bound_conjunction_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <expression/ast/from_duckdb.hpp>
 #include <helper/type_conversions.hpp>
 #include <log/logging.hpp>
 #include <op/scan/scan_utils.hpp>
@@ -24,18 +25,18 @@
 // standard library
 #include <format>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace sirius::op {
 
-std::vector<duckdb::idx_t> build_batch_column_map(
-  const duckdb::vector<duckdb::idx_t>& projection_ids, duckdb::idx_t column_ids_count)
+std::vector<std::optional<std::size_t>> build_batch_column_map(
+  const duckdb::vector<duckdb::idx_t>& projection_ids, std::size_t column_ids_count)
 {
-  constexpr auto NOT_PROJECTED = static_cast<duckdb::idx_t>(-1);
-  std::vector<duckdb::idx_t> map(column_ids_count, NOT_PROJECTED);
+  std::vector<std::optional<std::size_t>> map(column_ids_count);  // default-constructs to nullopt
 
   if (projection_ids.empty()) {
-    for (duckdb::idx_t i = 0; i < column_ids_count; i++) {
+    for (std::size_t i = 0; i < column_ids_count; i++) {
       map[i] = i;
     }
     return map;
@@ -47,7 +48,7 @@ std::vector<duckdb::idx_t> build_batch_column_map(
   std::vector<duckdb::idx_t> sorted(projection_ids.begin(), projection_ids.end());
   std::sort(sorted.begin(), sorted.end());
 
-  for (duckdb::idx_t batch_pos = 0; batch_pos < sorted.size(); batch_pos++) {
+  for (std::size_t batch_pos = 0; batch_pos < sorted.size(); batch_pos++) {
     if (sorted[batch_pos] < column_ids_count) { map[sorted[batch_pos]] = batch_pos; }
   }
   return map;
@@ -57,7 +58,8 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
   const duckdb::TableFilterSet& filters,
   const duckdb::vector<duckdb::ColumnIndex>& column_ids,
   const duckdb::vector<sirius::logical_type>& returned_types,
-  const std::vector<duckdb::idx_t>& batch_column_map)
+  const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
+  const std::unordered_set<std::size_t>& skip_primary_indices)
 {
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> filter_expressions;
 
@@ -68,20 +70,14 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
       continue;
     }
 
-    if (column_index >= column_ids.size()) {
-      throw std::runtime_error(
-        std::format("TABLE_SCAN filter: column_index ({}) >= column_ids.size() ({})",
-                    column_index,
-                    column_ids.size()));
+    auto primary_idx = column_ids.at(column_index).GetPrimaryIndex();
+    if (skip_primary_indices.count(primary_idx)) {
+      SIRIUS_LOG_DEBUG(
+        "TABLE_SCAN filter: skipping filter on primary_idx={} (hive partition or equivalent)",
+        primary_idx);
+      continue;
     }
-    auto primary_idx = column_ids[column_index].GetPrimaryIndex();
-    if (primary_idx >= returned_types.size()) {
-      throw std::runtime_error(
-        std::format("TABLE_SCAN filter: primary_idx ({}) >= returned_types.size() ({})",
-                    primary_idx,
-                    returned_types.size()));
-    }
-    auto col_type = returned_types[primary_idx];
+    auto const col_type = returned_types.at(primary_idx);
 
     SIRIUS_LOG_DEBUG("TABLE_SCAN filter: column_index={}, primary_idx={}, type={}, filter_type={}",
                      column_index,
@@ -89,11 +85,12 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
                      col_type.to_string(),
                      static_cast<int>(filter->filter_type));
 
-    auto batch_column_index = batch_column_map[column_index];
-    if (batch_column_index == static_cast<duckdb::idx_t>(-1)) {
+    auto const& batch_pos = batch_position_by_column_id[column_index];
+    if (!batch_pos.has_value()) {
       throw std::runtime_error(
         std::format("TABLE_SCAN filter: column_index ({}) not in projected batch", column_index));
     }
+    auto const batch_column_index = static_cast<duckdb::idx_t>(*batch_pos);
 
     SIRIUS_LOG_DEBUG("TABLE_SCAN filter: batch_column_index={}", batch_column_index);
 
@@ -112,6 +109,16 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
     conjunction->children.push_back(std::move(expr));
   }
   return conjunction;
+}
+
+std::optional<gpu_expression_translator::translated_expression>
+translate_duckdb_expression_with_names(gpu_expression_translator& translator,
+                                       duckdb::Expression const& expr,
+                                       gpu_expression_translator::column_name_resolver_fxn resolver)
+{
+  auto node = sirius::ast::from_duckdb(expr);
+  if (!node) { return std::nullopt; }
+  return translator.translate_expression_with_names(*node, std::move(resolver));
 }
 
 }  // namespace sirius::op

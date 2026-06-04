@@ -49,6 +49,7 @@ RUN_SCRIPT="$SCRIPT_DIR/run_tpch_parquet.sh"
 # ---------------------------------------------------------------------------
 generate_report() {
     local RUN_DIR="$1"
+    local FLOAT_TOL="${2:-1e-10}"
     local QUERIES=()
 
     # Discover which queries are present by scanning sirius/ and duckdb/ subdirs.
@@ -79,7 +80,7 @@ generate_report() {
 
     # ---------- Validation ----------
     echo ""
-    echo "=== Comparing results ==="
+    echo "=== Comparing results (float tolerance: $FLOAT_TOL) ==="
     echo "=========================================="
 
     has_error() {
@@ -117,8 +118,22 @@ generate_report() {
             status="success"
             (( ok++ ))
         else
-            status="validation"
-            (( validate++ ))
+            # Files differ byte-exact — fall back to tolerance-aware comparator
+            # so float/double columns within $FLOAT_TOL absolute diff still pass.
+            local cmp_msg
+            if cmp_msg=$(python3 "$SCRIPT_DIR/compare_results.py" \
+                    --float-tolerance "$FLOAT_TOL" \
+                    "$DUCKDB_FILE" "$SIRIUS_FILE" 2>&1); then
+                status="success"
+                (( ok++ ))
+                printf '  Q%s: success (within tolerance %s)\n' "$q" "$FLOAT_TOL"
+            else
+                status="validation"
+                (( validate++ ))
+                if [ -n "$cmp_msg" ]; then
+                    printf '  Q%s: validation — %s\n' "$q" "$cmp_msg"
+                fi
+            fi
         fi
 
         printf 'Q%s,%s\n' "$q" "$status" | tee -a "$VALIDATION_CSV"
@@ -248,11 +263,24 @@ generate_report() {
 # --report mode: regenerate comparison/timings from an existing run directory
 # ---------------------------------------------------------------------------
 if [ "${1:-}" = "--report" ]; then
-    if [ $# -ne 2 ]; then
-        echo "Usage: $0 --report <run_dir>"
+    shift
+    REPORT_FLOAT_TOL="1e-10"
+    while [ $# -gt 1 ]; do
+        case "$1" in
+            --float-tolerance)
+                REPORT_FLOAT_TOL="$2"
+                shift 2
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    if [ $# -ne 1 ]; then
+        echo "Usage: $0 --report [--float-tolerance <value>] <run_dir>"
         exit 1
     fi
-    RUN_DIR="$2"
+    RUN_DIR="$1"
     # Resolve relative paths against PROJECT_DIR/runs/ as a convenience.
     if [ ! -d "$RUN_DIR" ] && [ -d "$PROJECT_DIR/runs/$RUN_DIR" ]; then
         RUN_DIR="$PROJECT_DIR/runs/$RUN_DIR"
@@ -261,7 +289,7 @@ if [ "${1:-}" = "--report" ]; then
         echo "ERROR: run directory not found: $RUN_DIR"
         exit 1
     fi
-    generate_report "$RUN_DIR"
+    generate_report "$RUN_DIR" "$REPORT_FLOAT_TOL"
     exit 0
 fi
 
@@ -273,11 +301,21 @@ fi
 DUCKDB_RESULTS_DIR=""
 DUCKDB_FILE=""
 MULTI_SESSION=false
-CACHE_LEVEL=""
+DROP_OS_CACHE=false
+PINNING_MODE="none"
+FLOAT_TOL="1e-10"
 while [ $# -gt 1 ]; do
     case "$1" in
         --config)
             export SIRIUS_CONFIG_FILE="$2"
+            shift 2
+            ;;
+        --float-tolerance)
+            FLOAT_TOL="$2"
+            shift 2
+            ;;
+        --pinning-mode)
+            PINNING_MODE="$2"
             shift 2
             ;;
         --data-source)
@@ -320,9 +358,9 @@ while [ $# -gt 1 ]; do
             MULTI_SESSION=true
             shift
             ;;
-        --cache-level)
-            CACHE_LEVEL="$2"
-            shift 2
+        --drop-os-cache)
+            DROP_OS_CACHE=true
+            shift
             ;;
         *)
             break
@@ -333,16 +371,27 @@ done
 NUM_ITERATIONS="${NUM_ITERATIONS:-2}"
 QUERY_TIMEOUT="${QUERY_TIMEOUT:-1200}"
 
+case "$PINNING_MODE" in
+    none|per-query) ;;
+    *)
+        echo "ERROR: --pinning-mode must be 'none' or 'per-query' (got: $PINNING_MODE)"
+        exit 1
+        ;;
+esac
+
 if [ $# -ne 1 ]; then
     echo "Usage: $0 [--config <config_file>] [--data-source parquet|duckdb] [--parquet-dir <path>] [--duckdb-file <path>]"
-    echo "          [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] [--duckdb-results <run_dir>] [--multi-session] <scale_factor>"
-    echo "       $0 --report <run_dir>"
+    echo "          [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] [--duckdb-results <run_dir>]"
+    echo "          [--multi-session] [--drop-os-cache] [--pinning-mode none|per-query]"
+    echo "          [--float-tolerance <value>] <scale_factor>"
+    echo "       $0 --report [--float-tolerance <value>] <run_dir>"
     echo "  --data-source parquet  (default) → run_tpch_parquet.sh + test_datasets/tpch_parquet_sf<SF> or --parquet-dir"
     echo "  --data-source duckdb             → run_tpch_duckdb.sh + performance_test.duckdb or --duckdb-file"
     echo "Example: $0 --config ~/.sirius/sirius.yaml --engines sirius --iterations 3 --timeout 120 1000"
     echo "         $0 --duckdb-results runs/2026-03-10_sf1_2iter 1   # reuse stored DuckDB results for validation"
     echo "         $0 --multi-session --engines duckdb 100            # run DuckDB with fresh process per query"
     echo "         $0 --data-source duckdb --duckdb-file ./performance_test.duckdb 1"
+    echo "         $0 --multi-session --drop-os-cache --engines sirius 1000  # cold-run with OS cache drops"
     exit 1
 fi
 
@@ -461,6 +510,12 @@ echo "=== Collecting run info and filesystem benchmark ==="
         echo "source: $DUCKDB_RESULTS_DIR (copied, not re-run)"
         echo ""
     fi
+
+    echo "--- Benchmark settings ---"
+    echo "multi_session: $MULTI_SESSION"
+    echo "drop_os_cache: $DROP_OS_CACHE"
+    echo "pinning_mode: $PINNING_MODE"
+    echo ""
 
     echo "--- Benchmark input ---"
     echo "data_source: $DATA_SOURCE"
@@ -614,8 +669,13 @@ for engine in $ENGINES; do
     if [ "$MULTI_SESSION" = true ]; then
         EXTRA_ARGS+=(--multi-session)
     fi
-    if [ -n "$CACHE_LEVEL" ]; then
-        EXTRA_ARGS+=(--cache-level "$CACHE_LEVEL")
+    if [ "$DROP_OS_CACHE" = true ]; then
+        EXTRA_ARGS+=(--drop-os-cache)
+    fi
+    # Pinning is a Sirius-only feature; the runner ignores it for the duckdb engine,
+    # but we still pass the flag so DuckDB-engine logs reflect the requested mode.
+    if [ "$PINNING_MODE" != "none" ]; then
+        EXTRA_ARGS+=(--pinning-mode "$PINNING_MODE")
     fi
     OUTPUT_DIR="$ENGINE_DIR" "$RUN_SCRIPT" "${EXTRA_ARGS[@]}" "$engine" "$SF" "${QUERIES[@]}" \
         2>&1 | tee "$ENGINE_DIR/run.log"
@@ -626,5 +686,5 @@ for engine in $ENGINES; do
     fi
 done
 
-generate_report "$RUN_DIR" || OVERALL_STATUS=1
+generate_report "$RUN_DIR" "$FLOAT_TOL" || OVERALL_STATUS=1
 exit "$OVERALL_STATUS"

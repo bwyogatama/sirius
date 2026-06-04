@@ -21,8 +21,10 @@
 #include "data/convertible_gpu_pipeline_task.hpp"
 #include "log/logging.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <thread>
+#include <vector>
 
 namespace sirius {
 namespace parallel {
@@ -61,18 +63,35 @@ void downgrade_executor::start()
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
 
+  // HOST/DISK tier memory_spaces return device_id == -1; passing that to
+  // rmm::cuda_device_id or cudaSetDevice fails with cudaErrorInvalidDevice.
+  // Default the stream pool to GPU 0 for non-GPU tiers and skip per-thread
+  // CUDA binding entirely (the stream is ordering metadata; host/disk work
+  // is CPU-side).
   {
-    auto device_id = _memory_space ? _memory_space->get_device_id() : 0;
-    _stream_pool   = std::make_unique<cucascade::memory::exclusive_stream_pool>(
+    int device_id = 0;
+    if (_space_id.tier == cucascade::memory::Tier::GPU && _memory_space) {
+      device_id = _memory_space->get_device_id();
+    }
+    _stream_pool = std::make_unique<cucascade::memory::exclusive_stream_pool>(
       rmm::cuda_device_id{device_id}, _config.thread_pool.num_threads);
   }
 
   _request_queue.reactivate();
 
   absl::AnyInvocable<void() noexcept> per_thread_init = nullptr;
-  if (_memory_space) {
+  if (_memory_space && _space_id.tier == cucascade::memory::Tier::GPU) {
     auto device_id  = _memory_space->get_device_id();
-    per_thread_init = [device_id]() noexcept { cudaSetDevice(device_id); };
+    per_thread_init = [device_id]() noexcept {
+      // Pin each worker to its GPU; silent failure leaks downgrade memcpys
+      // across contexts. Lambda is noexcept, so check inline.
+      cudaError_t err = cudaSetDevice(device_id);
+      if (err != cudaSuccess) {
+        spdlog::error("downgrade_executor per-thread init: cudaSetDevice({}) failed: {}",
+                      device_id,
+                      cudaGetErrorString(err));
+      }
+    };
   }
 
   _pool = std::make_unique<exec::bounded_thread_pool>(_config.thread_pool.num_threads,
@@ -126,7 +145,8 @@ void downgrade_executor::processing_loop()
     auto request = _request_queue.pop();
     if (!request) break;  // interrupted
 
-    auto& req    = request;
+    auto& req = request;
+
     auto t_start = std::chrono::steady_clock::now();
 
     // Per-source tracking (repos vs pipeline_queue)
@@ -146,11 +166,26 @@ void downgrade_executor::processing_loop()
     // Resolve the source memory space for filtering candidates
     auto* source_space = _reservation_manager.get_memory_space(_space_id.tier, _space_id.device_id);
 
-    // Build target spaces list: for GPU->HOST downgrade, target is HOST tier followed by DISK tier
+    // Build target spaces list: for GPU->HOST downgrade, target is HOST tier followed by DISK tier.
+    // NUMA preference (from downgrade_executor_config, v1.0 dd86dd0 intent re-authored on the
+    // post-#637 architecture): if preferred_numa_node is set, stable_partition the matching HOST
+    // space(s) to the front of target_spaces so cand->convert() tries the NUMA-local space first.
     std::vector<const cucascade::memory::memory_space*> target_spaces;
     if (_space_id.tier == cucascade::memory::Tier::GPU) {
-      auto host_spaces =
+      auto host_span =
         _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+      // Copy span -> vector before reordering: the span is a view into the manager's
+      // internal storage, and stable_partition would otherwise mutate it in place.
+      std::vector<const cucascade::memory::memory_space*> host_spaces(host_span.begin(),
+                                                                      host_span.end());
+      if (auto pref = _config.preferred_numa_node; pref.has_value()) {
+        std::stable_partition(host_spaces.begin(),
+                              host_spaces.end(),
+                              [pref_numa = *pref](const cucascade::memory::memory_space* s) {
+                                return s != nullptr &&
+                                       static_cast<int>(s->get_device_id()) == pref_numa;
+                              });
+      }
       for (auto* hs : host_spaces) {
         target_spaces.push_back(hs);
       }
@@ -158,6 +193,7 @@ void downgrade_executor::processing_loop()
     size_t host_end_idx = target_spaces.size();
     auto disk_spaces =
       _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK);
+    bool disk_not_configured = disk_spaces.empty();
     for (auto* ds : disk_spaces) {
       target_spaces.push_back(ds);
     }
@@ -204,7 +240,7 @@ void downgrade_executor::processing_loop()
            &host_target_stats,
            &disk_target_stats]() mutable {
             try {
-              auto result = cand->convert(targets, exc_stream, res_mgr);
+              auto result = cand->convert(targets, exc_stream, res_mgr, false);
               if (result) {
                 req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
                 req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
@@ -230,13 +266,16 @@ void downgrade_executor::processing_loop()
       if (pool_interrupted) break;
     }
 
-    // === TIER 2: pipeline_executor task queue ===
+    // === TIER 2: task_scheduler task queue ===
     if (!req->satisfied.load() && _pipeline_task_queue) {
+      size_t max_tasks_to_convert = _pipeline_task_queue->size();
+      size_t tasks_converted      = 0;
       convertible_gpu_pipeline_task_provider pipeline_provider(*_pipeline_task_queue);
-      while (!req->satisfied.load()) {
+      while (!req->satisfied.load() && tasks_converted < max_tasks_to_convert) {
         auto candidate =
           pipeline_provider.get_next_convertible(source_space, /*front_to_back=*/false);
         if (!candidate) break;
+        tasks_converted++;
 
         auto candidate_bytes = candidate->bytes_in_space(source_space);
 
@@ -261,7 +300,7 @@ void downgrade_executor::processing_loop()
            &host_target_stats,
            &disk_target_stats]() mutable {
             try {
-              auto result = cand->convert(targets, exc_stream, res_mgr);
+              auto result = cand->convert(targets, exc_stream, res_mgr, false);
               if (result) {
                 req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
                 req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
@@ -288,6 +327,14 @@ void downgrade_executor::processing_loop()
 
     // Wait for all in-flight work to finish (predicate also checked in workers)
     _pool->wait_all();
+
+    if (disk_not_configured && !req->satisfied.load()) {
+      SIRIUS_LOG_WARN(
+        "[downgrade] [{}] downgrade request not satisfied and disk memory space is not configured; "
+        "data cannot be spilled to disk. Consider configuring a disk memory space to enable "
+        "spilling.",
+        _source_label);
+    }
 
     // === Logging ===
     auto total_bytes   = req->bytes_freed.load(std::memory_order_relaxed);

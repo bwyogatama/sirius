@@ -12,6 +12,7 @@ The `sirius_config` class loads configuration from a YAML file or uses built-in 
 - Memory space configurations (GPU, Host, Disk)
 - Thread pool configs for all executor types
 - Operator parameters (batch sizes, limits)
+- Telemetry options
 
 ### Config File Resolution
 
@@ -107,6 +108,10 @@ sirius:
     hash_partition_bytes: 5Gi
     concat_batch_bytes: 5Gi
     max_build_hash_table_bytes: 500Mi
+  telemetry:
+    enable_quent: false
+    output_directory: telemetry_data
+    engine_name: siriusDB
 ```
 
 ## Memory Configuration
@@ -191,6 +196,24 @@ The gap between `trigger` and `stop` prevents oscillation — without it, evicti
 
 **Note:** `max_build_hash_table_bytes` can be larger than `concat_batch_bytes`. When it is, the partition operator configures CONCAT to concatenate all batches, enabling the more efficient BUILD_PROBE join mode for larger build sides. Other joins (STANDARD, MIXED) still use `concat_batch_bytes` as the batch size threshold.
 
+## Telemetry
+
+```yaml
+sirius:
+  telemetry:
+    enable_quent: true
+    output_directory: telemetry_data
+    engine_name: siriusDB
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enable_quent` | bool | false | Emit Quent telemetry using the ndjson exporter. When false, telemetry uses the noop exporter. |
+| `output_directory` | string | `telemetry_data` | Directory for Quent ndjson files. |
+| `engine_name` | string | `siriusDB` | Engine name reported in engine-level telemetry. |
+
+Per-query labels are configured separately with `CALL sirius_set_query_label(...)` SQL function or the `query_label` named parameter on `gpu_execution(...)`.
+
 ## Thread Pool Configuration
 
 | Pool | Default Threads | Thread Name Prefix | Purpose |
@@ -261,7 +284,7 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 |----------|---------|-------------|
 | `print_gpu_table_max_rows` | - | Max rows to print in debug output |
 | `enable_fallback_check` | - | Enable fallback validation |
-| `enable_duckdb_fallback` | false | Fall back to DuckDB CPU on Sirius errors |
+| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU on Sirius errors. Matches the legacy `gpu_processing` path. Set to `false` to surface Sirius errors instead of silently falling back. |
 | `enable_regex_jit_impl` | - | Use JIT regex implementation |
 
 ## Legacy Config Flags
@@ -275,7 +298,7 @@ Static constants from `namespace duckdb::Config` (used by legacy Sirius) and `na
 | `USE_PIN_MEM_FOR_CPU_PROCESSING` | true | `duckdb::Config` |
 | `USE_PIN_MEM_FOR_CACHING` | false | `duckdb::Config` |
 | `USE_CUDF_EXPR` | true | `duckdb::Config` |
-| `ENABLE_DUCKDB_FALLBACK` | false | `duckdb::Config` |
+| `ENABLE_DUCKDB_FALLBACK` | true | `duckdb::Config` |
 | `NUM_GPU_EXECUTOR_THREADS` | 2 | `sirius::Config` |
 | `NUM_PIPELINE_EXECUTOR_THREADS` | 1 | `sirius::Config` |
 | `NUM_GPU` | 1 | `sirius::Config` |

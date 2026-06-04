@@ -16,12 +16,15 @@
 
 #pragma once
 
+// sirius
+#include "expression/function_id.hpp"
+#include "helper/logical_type.hpp"  // sirius::type_id
+
 // duckdb
 #include <duckdb/common/types.hpp>
 
 // standard library
 #include <array>
-#include <string_view>
 
 // Internal header shared by expression-executor .cpp files that need to consult the static
 // allow-lists of AST-compatible CAST target types and BOUND_FUNCTION names. Keeps DuckDB
@@ -33,8 +36,17 @@ namespace sirius {
 inline constexpr std::array<duckdb::LogicalTypeId, 3> supported_ast_cast_types{
   {duckdb::LogicalTypeId::UBIGINT, duckdb::LogicalTypeId::BIGINT, duckdb::LogicalTypeId::DOUBLE}};
 
+/// Sirius-typed mirror of supported_ast_cast_types — same set of CAST target
+/// types as above, expressed via sirius::type_id for native AST consumers.
+inline constexpr std::array<sirius::type_id, 3> supported_ast_cast_types_native{
+  {sirius::type_id::UBIGINT, sirius::type_id::BIGINT, sirius::type_id::DOUBLE}};
+
 /// BOUND_FUNCTION names that are currently safe to lower into a cuDF AST.
-inline constexpr std::array<std::string_view, 6> supported_ast_functions{
-  "+", "-", "*", "/", "//", "%"};
+inline constexpr std::array<function_id, 6> supported_ast_functions{function_id::add,
+                                                                    function_id::sub,
+                                                                    function_id::mul,
+                                                                    function_id::div,
+                                                                    function_id::int_div,
+                                                                    function_id::mod};
 
 }  // namespace sirius

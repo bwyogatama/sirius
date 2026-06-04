@@ -18,6 +18,7 @@
 
 // sirius
 #include <config.hpp>
+#include <expression/ast/node.hpp>  // sirius::ast::node + 11 alternative types
 #include <expression/expression.hpp>
 #include <expression_executor/expression_executor_strategy.hpp>
 
@@ -41,15 +42,6 @@
 
 namespace duckdb {
 class Expression;
-class BoundBetweenExpression;
-class BoundCaseExpression;
-class BoundCastExpression;
-class BoundComparisonExpression;
-class BoundConjunctionExpression;
-class BoundConstantExpression;
-class BoundFunctionExpression;
-class BoundOperatorExpression;
-class BoundReferenceExpression;
 }  // namespace duckdb
 
 namespace sirius {
@@ -308,12 +300,13 @@ class gpu_expression_executor {
     std::size_t min_ast_size                    = 2);
 
   /**
-   * @brief Non-owning ctor for internal call sites that already hold a raw duckdb::Expression
-   * pointer (e.g., NLJ lambda over cuDF expressions, parquet scan filter pushdown). The caller
-   * retains ownership; the executor only reads from the expression.
+   * @brief Non-owning ctor for call sites that hold a raw sirius::ast::node pointer
+   * (e.g., NLJ lambda over cuDF expressions, parquet scan filter pushdown).
+   *
+   * The caller retains ownership; the executor only reads from the node tree.
    */
   gpu_expression_executor(
-    duckdb::Expression const* expression,
+    sirius::ast::node const* expression,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     rmm::cuda_stream_view stream                = cudf::get_default_stream(),
     expression_executor_strategy strategy       = strategy_from_config(),
@@ -323,21 +316,39 @@ class gpu_expression_executor {
    * @brief Executes the current set of expressions against the given input batch and emits a new
    * output batch with the results.
    *
-   * @param input_batch The input batch against which to evaluate expressions.
-   * @return A new batch containing the results of expression evaluation.
+   * @param input_batch The read-only locked input batch against which to evaluate expressions.
+   * @return A new idle batch containing the results of expression evaluation.
    */
-  std::shared_ptr<data_batch> execute(std::shared_ptr<data_batch> input_batch);
+  std::unique_ptr<cudf::table> execute(cudf::table_view input);
 
   /**
    * @brief Selects rows from the input batch based on the executor's (singular) expression.
    *
-   * @param input_batch The input batch from which to select rows.
-   * @return A new batch containing the selected rows.
+   * @param input_batch The read-only locked input batch from which to select rows.
+   * @return A new idle batch containing the selected rows.
    */
-  std::shared_ptr<data_batch> select(std::shared_ptr<data_batch> input_batch);
+  std::unique_ptr<cudf::table> select(cudf::table_view input);
+
+  /**
+   * @brief Evaluate a single Sirius AST node and return its execution result.
+   *
+   * Dispatches via std::visit over @p expr's variant to the matching private
+   * per-alternative overload. The per-alternative overloads currently round-
+   * trip back to the existing DuckDB-typed execute() via sirius::ast::to_duckdb;
+   * subsequent commits replace the round-trip with native Sirius-AST evaluation
+   * one specialization at a time. See
+   * https://github.com/sirius-db/sirius/issues/699 for the per-specialization
+   * migration plan.
+   *
+   * @param expr The Sirius AST node to evaluate.
+   * @param mode AST hint vs. MATERIALIZE hint; honored only where the node kind
+   *             supports AST mode. AST breakers (case_expr, coalesce, op_try,
+   *             etc.) always materialize regardless of the hint.
+   */
+  execute_result execute(sirius::ast::node const& expr, execution_mode mode = execution_mode::AST);
 
  private:
-  std::vector<duckdb::Expression const*> _expressions;  ///< The expressions to execute
+  std::vector<sirius::ast::node const*> _ast_expressions;  ///< The AST expressions to execute
   expression_executor_strategy _strategy;  ///< The strategy to use for expression evaluation
   rmm::device_async_resource_ref _mr;  ///< The allocator to pass to cudf APIs for any allocations
   rmm::cuda_stream_view _stream;       ///< The stream in which to execute any cuDF operations
@@ -377,26 +388,24 @@ class gpu_expression_executor {
   void release_temporaries(std::vector<std::vector<std::size_t>> const& scalar_indices,
                            std::vector<std::vector<std::size_t>> const& column_indices);
 
-  // Generic execute method
-  execute_result execute(duckdb::Expression const& expr, execution_mode mode = execution_mode::AST);
+  // Leaf Sirius-AST nodes — dispatch targets for the std::visit-based
+  // execute(sirius::ast::node, mode) above.
+  execute_result execute(sirius::ast::reference const& expr, execution_mode mode);
+  execute_result execute(sirius::ast::constant const& expr, execution_mode mode);
 
-  // Leaf expression nodes
-  execute_result execute(duckdb::BoundReferenceExpression const& expr, execution_mode mode);
-  execute_result execute(duckdb::BoundConstantExpression const& expr, execution_mode mode);
-
-  // Interior expression nodes
-  execute_result execute(duckdb::BoundBetweenExpression const& expr, execution_mode mode);
-  execute_result execute(duckdb::BoundCaseExpression const& expr, execution_mode mode);
-  execute_result execute(duckdb::BoundCastExpression const& expr, execution_mode mode);
-  execute_result execute(duckdb::BoundComparisonExpression const& expr, execution_mode mode);
-  execute_result execute(duckdb::BoundConjunctionExpression const& expr, execution_mode mode);
-  execute_result execute(duckdb::BoundFunctionExpression const& expr, execution_mode mode);
-  execute_result execute(duckdb::BoundOperatorExpression const& expr, execution_mode mode);
-
-  // Counts the number of AST nodes that would be generated for the given expression if we
-  // added it to the AST tree. This is used to determine whether we should execute in AST mode or
-  // MATERIALIZE mode for the expression (by comparing the count to `min_ast_size`).
-  [[nodiscard]] std::size_t count_ast_ops(duckdb::Expression const& expr) const;
+  // Interior Sirius-AST nodes — 11 alternatives total. Compared to the 9
+  // DuckDB-typed overloads, Sirius AST splits BOUND_OPERATOR's kinds across
+  // 3 alternative types (unary_op, coalesce, in_list).
+  execute_result execute(sirius::ast::between const& expr, execution_mode mode);
+  execute_result execute(sirius::ast::case_expr const& expr, execution_mode mode);
+  execute_result execute(sirius::ast::cast const& expr, execution_mode mode);
+  execute_result execute(sirius::ast::comparison const& expr, execution_mode mode);
+  execute_result execute(sirius::ast::conjunction const& expr, execution_mode mode);
+  execute_result execute(sirius::ast::function_call const& expr, execution_mode mode);
+  execute_result execute(sirius::ast::unary_op const& expr, execution_mode mode);
+  execute_result execute(sirius::ast::coalesce const& expr, execution_mode mode);
+  execute_result execute(sirius::ast::in_list const& expr, execution_mode mode);
+  execute_result execute(sirius::ast::aggregate const& expr, execution_mode mode);
 };
 
 }  // namespace sirius

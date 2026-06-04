@@ -63,12 +63,8 @@ TEMPLATE_TEST_CASE(
   auto [input_table, expected_table] =
     sirius::test::make_test_data_for_grouped_aggregate<Traits>(num_groups, 1, stream, mr);
 
-  std::shared_ptr<data_batch> input_batch = sirius::make_data_batch(std::move(input_table), *space);
-
-  // Create DuckDB context for aggregate function binding
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto& context = *con.context;
+  std::shared_ptr<data_batch> input_batch =
+    sirius::make_data_batch(std::move(input_table), *space, stream);
 
   // Create aggregate expressions: GROUP BY column 0, SUM(column 1)
   auto agg_result = sirius::test::create_aggregate_expressions<Traits>(
@@ -78,8 +74,7 @@ TEMPLATE_TEST_CASE(
   );
 
   // Create the grouped aggregate merge operator
-  sirius_physical_grouped_aggregate grouped_aggregator(context,
-                                                       std::move(agg_result.output_types),
+  sirius_physical_grouped_aggregate grouped_aggregator(std::move(agg_result.output_types),
                                                        std::move(agg_result.aggregates),
                                                        std::move(agg_result.groups),
                                                        num_groups);
@@ -121,11 +116,8 @@ TEMPLATE_TEST_CASE("sirius_physical_grouped_aggregate grouped aggregates with AV
   auto [input_table, expected_table] =
     sirius::test::make_test_data_for_grouped_aggregate_with_avg<Traits>(num_groups, 1, stream, mr);
 
-  std::shared_ptr<data_batch> input_batch = sirius::make_data_batch(std::move(input_table), *space);
-
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto& context = *con.context;
+  std::shared_ptr<data_batch> input_batch =
+    sirius::make_data_batch(std::move(input_table), *space, stream);
 
   // AVG is decomposed into SUM + COUNT_VALID internally
   auto agg_result = sirius::test::create_aggregate_expressions<Traits>(
@@ -134,8 +126,7 @@ TEMPLATE_TEST_CASE("sirius_physical_grouped_aggregate grouped aggregates with AV
     {1, 1, 1, 1}                     // all on column 1
   );
 
-  sirius_physical_grouped_aggregate grouped_aggregator(context,
-                                                       std::move(agg_result.output_types),
+  sirius_physical_grouped_aggregate grouped_aggregator(std::move(agg_result.output_types),
                                                        std::move(agg_result.aggregates),
                                                        std::move(agg_result.groups),
                                                        num_groups);
@@ -146,12 +137,9 @@ TEMPLATE_TEST_CASE("sirius_physical_grouped_aggregate grouped aggregates with AV
 
   // The local operator outputs expanded columns: group_key, min, max, count, sum, count_valid
   // (AVG decomposed into SUM + COUNT_VALID). Verify column count = 1 group + 5 aggregates.
-  auto& output_table = dynamic_cast<const pipelineable_operator_data&>(*outputs)
-                         .get_data_batches()[0]
-                         ->get_data()
-                         ->cast<cucascade::gpu_table_representation>()
-                         .get_table();
-  REQUIRE(output_table.view().num_columns() == 6);  // 1 group + 3 non-avg + 2 (sum+count for avg)
+  auto output_view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
+  REQUIRE(output_view.num_columns() == 6);  // 1 group + 3 non-avg + 2 (sum+count for avg)
 }
 
 TEMPLATE_TEST_CASE(
@@ -182,12 +170,8 @@ TEMPLATE_TEST_CASE(
   auto [input_table, expected_table] =
     sirius::test::make_test_data_for_grouped_aggregate<Traits>(num_groups, 2, stream, mr);
 
-  std::shared_ptr<data_batch> input_batch = sirius::make_data_batch(std::move(input_table), *space);
-
-  // Create DuckDB context for aggregate function binding
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
-  auto& context = *con.context;
+  std::shared_ptr<data_batch> input_batch =
+    sirius::make_data_batch(std::move(input_table), *space, stream);
 
   // Create aggregate expressions: GROUP BY column 0, SUM(column 1)
   auto agg_result = sirius::test::create_aggregate_expressions<Traits>(
@@ -197,8 +181,7 @@ TEMPLATE_TEST_CASE(
   );
 
   // Create the grouped aggregate merge operator
-  sirius_physical_grouped_aggregate grouped_aggregator(context,
-                                                       std::move(agg_result.output_types),
+  sirius_physical_grouped_aggregate grouped_aggregator(std::move(agg_result.output_types),
                                                        std::move(agg_result.aggregates),
                                                        std::move(agg_result.groups),
                                                        num_groups);

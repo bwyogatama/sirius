@@ -80,15 +80,61 @@ static void from_yaml(const YAML::Node& node, exec::thread_pool_config& opt)
   r.reject_unknown();
 }
 
+static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config& opt)
+{
+  yaml::reader r(node, "scan_manager");
+  r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
+  r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
+  r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
+  r.optional("use_sirius_datasource", opt.use_sirius_datasource);
+  r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
+  r.optional("uring_ring_entries", opt.uring_ring_entries, yaml::greater_than<unsigned>{0});
+  r.optional("enable_prefetch_cache", opt.enable_prefetch_cache);
+  r.optional("prefetch_buffer_pool_bytes", yaml::bytes(opt.prefetch_buffer_pool_bytes));
+  r.optional("prefetch_inflight_budget_chunks",
+             opt.prefetch_inflight_budget_chunks,
+             yaml::greater_than<std::size_t>{0});
+  r.optional("enable_chunk_prewarm", opt.enable_chunk_prewarm);
+  r.reject_unknown();
+}
+
+static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& opt)
+{
+  yaml::reader r(node, "object_store_config");
+  r.optional("endpoint", opt.endpoint);
+  r.optional("region", opt.region);
+  r.optional("access_key", opt.access_key);
+  r.optional("secret_key", opt.secret_key);
+  r.optional("session_token", opt.session_token);
+  r.optional("s3_transport", opt.s3_transport);
+  r.optional("signing_mode", opt.s3_signing_mode);
+  r.optional("ca_bundle_path", opt.ca_bundle_path);
+  r.optional("tls_verify", opt.tls_verify);
+  r.reject_unknown();
+}
+
 static void from_yaml(const YAML::Node& node, operator_params& opt)
 {
   yaml::reader r(node, "operator_params");
   r.optional("scan_task_batch_size", yaml::bytes(opt.scan_task_batch_size));
   r.optional("default_scan_task_varchar_size", yaml::bytes(opt.default_scan_task_varchar_size));
   r.optional("max_sort_partition_bytes", yaml::bytes(opt.max_sort_partition_bytes));
+  r.optional("max_sort_partition_memory_fraction",
+             opt.max_sort_partition_memory_fraction,
+             yaml::fraction<double>{});
   r.optional("hash_partition_bytes", yaml::bytes(opt.hash_partition_bytes));
   r.optional("concat_batch_bytes", yaml::bytes(opt.concat_batch_bytes));
   r.optional("max_build_hash_table_bytes", yaml::bytes(opt.max_build_hash_table_bytes));
+  r.optional("enable_gpu_duckdb_native_scan", opt.enable_gpu_duckdb_native_scan);
+  r.reject_unknown();
+}
+
+static void from_yaml(const YAML::Node& node, telemetry_config& opt)
+{
+  yaml::reader r(node, "telemetry");
+  r.optional("enable_quent", opt.enable_quent);
+  r.optional("output_directory", opt.output_directory);
+  r.optional("engine_name", opt.engine_name);
   r.reject_unknown();
 }
 
@@ -213,6 +259,11 @@ struct host_mem_config {
 
   void setup_configurator(cucascade::memory::reservation_manager_configurator& builder) const
   {
+    // cucascade builds one numa_region_pinned_host_memory_resource per
+    // distinct NUMA node when the configurator sees this call. Relied upon by
+    // SiriusContext::initialize() which asserts host_spaces.size() ==
+    // topology.num_numa_nodes on the default path. YAML configs may override
+    // by explicitly setting per-space numa_id.
     builder.use_host_per_numa();
     if (std::holds_alternative<double>(reservation_limit)) {
       builder.set_reservation_fraction_per_host(std::get<double>(reservation_limit));
@@ -323,6 +374,7 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     if (auto exec_node = r.optional_node("executor")) {
       yaml::reader er(*exec_node, "sirius.executor");
       if (auto n = er.optional_node("task_creator")) from_yaml(*n, _task_creator_config);
+      if (auto n = er.optional_node("scan_manager")) from_yaml(*n, _scan_manager_config);
       if (auto n = er.optional_node("pipeline")) from_yaml(*n, _gpu_pipeline_executor_config);
       if (auto n = er.optional_node("downgrade")) from_yaml(*n, _downgrade_executor_config);
       if (auto n = er.optional_node("duckdb_scan")) sirius::from_yaml(*n, _scan_executor_config);
@@ -331,6 +383,14 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
 
     // Operator params
     if (auto n = r.optional_node("operator_params")) { sirius::from_yaml(*n, _operator_params); }
+
+    // Object store (S3) config — endpoint / credentials for the s3:// datasource.
+    if (auto n = r.optional_node("object_store_config")) {
+      sirius::from_yaml(*n, object_store_config);
+    }
+
+    // Telemetry
+    if (auto n = r.optional_node("telemetry")) { sirius::from_yaml(*n, _telemetry_config); }
 
     // Explicit space configs (low-level API)
     std::vector<cucascade::memory::gpu_memory_space_config> gpu_space_configs;
@@ -400,6 +460,16 @@ const exec::downgrade_executor_config& sirius_config::get_downgrade_executor_con
 const exec::thread_pool_config& sirius_config::get_task_creator_config() const noexcept
 {
   return _task_creator_config;
+}
+
+const scan_manager::scan_manager_config& sirius_config::get_scan_manager_config() const noexcept
+{
+  return _scan_manager_config;
+}
+
+void sirius_config::set_scan_manager_config(scan_manager::scan_manager_config config) noexcept
+{
+  _scan_manager_config = std::move(config);
 }
 
 const exec::thread_pool_config& sirius_config::get_duckdb_scan_executor_config() const noexcept
